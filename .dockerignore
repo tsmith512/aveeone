@@ -1,0 +1,8 @@
+node_modules
+.git
+.wrangler
+src
+*.md
+wrangler.jsonc
+tsconfig.json
+package-lock.json

@@ -1,0 +1,41 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "aveeone",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-03-07",
+  "compatibility_flags": ["nodejs_compat"],
+
+  // Observability on with 100% trace sampling, per project requirements.
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+
+  // The ffmpeg container, built from ./Dockerfile. AV1 encoding is CPU-heavy,
+  // so we use a "standard" instance class (standard-4 = most vCPU available).
+  "containers": [
+    {
+      "class_name": "Transcoder",
+      "image": "./Dockerfile",
+      "instance_type": "standard-4",
+      "max_instances": 10
+    }
+  ],
+
+  // Containers are backed by Durable Objects.
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "TRANSCODER",
+        "class_name": "Transcoder"
+      }
+    ]
+  },
+
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["Transcoder"]
+    }
+  ]
+}
