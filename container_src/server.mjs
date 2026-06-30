@@ -10,6 +10,11 @@
 
 import { createServer } from "node:http";
 import { spawn, execFile } from "node:child_process";
+import { createReadStream } from "node:fs";
+import { stat, unlink } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { randomUUID } from "node:crypto";
 
 const PORT = Number(process.env.PORT) || 8080;
 
@@ -103,12 +108,15 @@ function preflightSource(sourceUrl) {
 
 // ffmpeg encode settings are fixed per the project spec (no options/flags).
 // Input options go *before* -i. We add reconnect options for resilience when
-// pulling the source over http(s).
-function buildFfmpegArgs(sourceUrl) {
+// pulling the source over http(s). Output is written to a seekable file so we
+// can use +faststart (moov atom at the front) for clean VOD seeking; the
+// finished file is then streamed to the Worker and uploaded to R2.
+function buildFfmpegArgs(sourceUrl, outPath) {
   return [
     "-hide_banner",
     "-loglevel",
     "error",
+    "-y", // overwrite the (pre-generated unique) temp path if it exists
     // Resilience for the network source:
     "-reconnect",
     "1",
@@ -134,13 +142,13 @@ function buildFfmpegArgs(sourceUrl) {
     "-dn",
     "-map_chapters",
     "-1",
-    // Fragmented MP4 so the moov atom isn't required at the end -> streamable
-    // out of a pipe (no seekable output / faststart needed).
+    // Standard (non-fragmented) MP4 with the moov atom relocated to the front
+    // for fast start / seeking. Requires a seekable output, hence the temp file.
     "-movflags",
-    "+frag_keyframe+empty_moov+default_base_moof",
+    "+faststart",
     "-f",
     "mp4",
-    "pipe:1",
+    outPath,
   ];
 }
 
@@ -190,16 +198,21 @@ async function handleTranscode(req, res) {
     });
   }
 
-  const args = buildFfmpegArgs(sourceUrl);
+  // Encode to a unique temp file. We only respond once ffmpeg has fully and
+  // successfully written the file, so the Worker gets a clean 200-on-success
+  // contract (with Content-Length) and never caches a truncated object.
+  const outPath = join(tmpdir(), `aveeone-${randomUUID()}.mp4`);
+  const args = buildFfmpegArgs(sourceUrl, outPath);
   console.log(
     "aveeone.container.spawn",
-    JSON.stringify({ requestId, sourceUrl }),
+    JSON.stringify({ requestId, sourceUrl, outPath }),
   );
 
   let ffmpeg;
   try {
-    ffmpeg = spawn("ffmpeg", args, { stdio: ["ignore", "pipe", "pipe"] });
+    ffmpeg = spawn("ffmpeg", args, { stdio: ["ignore", "ignore", "pipe"] });
   } catch (err) {
+    await unlink(outPath).catch(() => {});
     return sendJsonError(res, 500, {
       error: "Failed to spawn ffmpeg",
       stage: "spawn",
@@ -218,94 +231,80 @@ async function handleTranscode(req, res) {
     }
   });
 
-  let streaming = false; // true once we've committed a 200 + started piping
-  let settled = false; // guards against double-responding
+  // Wait for ffmpeg to finish (resolve with exit code, or reject on spawn error).
+  const exitCode = await new Promise((resolve, reject) => {
+    ffmpeg.on("error", reject);
+    ffmpeg.on("close", (code) => resolve(code));
+  }).catch((err) => {
+    return { spawnError: err };
+  });
 
-  // If the client/Worker goes away, kill ffmpeg so we don't leak the process.
-  const onClientGone = () => {
-    if (!ffmpeg.killed) ffmpeg.kill("SIGKILL");
-  };
-  res.on("close", onClientGone);
-
-  // Only commit to a 200 once ffmpeg actually produces output. This lets us
-  // still return a clean 500 JSON for early failures (bad URL, decode error,
-  // unsupported input, etc.) before any bytes are sent.
-  ffmpeg.stdout.once("data", (firstChunk) => {
-    if (settled) return;
-    streaming = true;
-    res.writeHead(200, {
-      "content-type": "video/mp4",
-      "x-request-id": String(requestId),
-      "cache-control": "no-store",
+  if (exitCode && typeof exitCode === "object" && exitCode.spawnError) {
+    await unlink(outPath).catch(() => {});
+    return sendJsonError(res, 500, {
+      error: "ffmpeg process error",
+      stage: "ffmpeg-error",
+      requestId,
+      sourceUrl,
+      details: String(exitCode.spawnError),
+      stderr: stderrTail.trim() || undefined,
     });
-    res.write(firstChunk);
-    ffmpeg.stdout.pipe(res);
+  }
+
+  if (exitCode !== 0) {
+    await unlink(outPath).catch(() => {});
+    return sendJsonError(res, 500, {
+      error: "ffmpeg exited with a non-zero status",
+      stage: "ffmpeg-exit",
+      requestId,
+      sourceUrl,
+      exitCode,
+      stderr: stderrTail.trim() || undefined,
+    });
+  }
+
+  // Success: stream the finished file with a known Content-Length, then clean up.
+  let size;
+  try {
+    ({ size } = await stat(outPath));
+  } catch (err) {
+    await unlink(outPath).catch(() => {});
+    return sendJsonError(res, 500, {
+      error: "Encoded output missing after ffmpeg success",
+      stage: "post-encode-stat",
+      requestId,
+      sourceUrl,
+      details: err instanceof Error ? err.message : String(err),
+    });
+  }
+
+  console.log(
+    "aveeone.container.done",
+    JSON.stringify({ requestId, sourceUrl, size }),
+  );
+
+  res.writeHead(200, {
+    "content-type": "video/mp4",
+    "content-length": String(size),
+    "x-request-id": String(requestId),
+    "cache-control": "no-store",
   });
 
-  ffmpeg.on("error", (err) => {
-    if (settled) return;
-    settled = true;
-    if (!streaming) {
-      sendJsonError(res, 500, {
-        error: "ffmpeg process error",
-        stage: "ffmpeg-error",
-        requestId,
-        sourceUrl,
-        details: err instanceof Error ? err.message : String(err),
-        stderr: stderrTail.trim() || undefined,
-      });
-    } else {
-      // Already streaming; can't change status. Truncate the response.
-      res.end();
-      console.error(
-        "aveeone.container.mid-stream-error",
-        JSON.stringify({ requestId, details: String(err) }),
-      );
-    }
+  const fileStream = createReadStream(outPath);
+  const cleanup = () => {
+    unlink(outPath).catch(() => {});
+  };
+  fileStream.on("error", (err) => {
+    console.error(
+      "aveeone.container.stream-error",
+      JSON.stringify({ requestId, details: String(err) }),
+    );
+    res.destroy(err);
+    cleanup();
   });
-
-  ffmpeg.on("close", (code, signal) => {
-    if (settled) return;
-    settled = true;
-
-    if (code === 0) {
-      // Success path: piping already ends the response when stdout closes,
-      // but end() is safe/idempotent if there was zero output.
-      if (!res.writableEnded) res.end();
-      console.log(
-        "aveeone.container.done",
-        JSON.stringify({ requestId, sourceUrl }),
-      );
-      return;
-    }
-
-    // Non-zero exit.
-    if (!streaming) {
-      sendJsonError(res, 500, {
-        error: "ffmpeg exited with a non-zero status before producing output",
-        stage: "ffmpeg-exit",
-        requestId,
-        sourceUrl,
-        exitCode: code,
-        signal: signal || undefined,
-        stderr: stderrTail.trim() || undefined,
-      });
-    } else {
-      // Failure after we already sent a 200; the stream is necessarily
-      // truncated. Best we can do is end and log full context.
-      if (!res.writableEnded) res.end();
-      console.error(
-        "aveeone.container.mid-stream-exit",
-        JSON.stringify({
-          requestId,
-          sourceUrl,
-          exitCode: code,
-          signal,
-          stderr: stderrTail.trim(),
-        }),
-      );
-    }
-  });
+  fileStream.on("close", cleanup);
+  res.on("close", () => fileStream.destroy());
+  fileStream.pipe(res);
 }
 
 const server = createServer((req, res) => {

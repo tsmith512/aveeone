@@ -33,8 +33,12 @@ https://aveeone.tsmith.net/
 
 ```
 client ──▶ Worker (src/index.ts)
-                │  parses source URL from the path
-                │  validates it's http(s)
+                │  parse + validate source URL from the path
+                │  key = OUTPUT_PREFIX/av1-unedited/sha256(sourceUrl)
+                ▼
+           R2 "OUTPUTS"  ──hit──▶  serve object (Content-Length, Range/206)
+                │
+               miss (GET)
                 ▼
            Container DO "Transcoder"  (one ffmpeg per instance)
                 │  container_src/server.mjs receives X-Source-Url
@@ -44,32 +48,44 @@ client ──▶ Worker (src/index.ts)
                    -c:v libsvtav1 -preset 6 -crf 26
                    -c:a aac
                    -dn -map_chapters -1
-                   -movflags +frag_keyframe+empty_moov+default_base_moof
-                   -f mp4 pipe:1
-                │  stdout (fragmented MP4)
+                   -movflags +faststart
+                   -f mp4 /tmp/<id>.mp4        (encode to disk)
+                │  responds 200 + Content-Length ONLY on ffmpeg exit 0
                 ▼
-           streamed back through the Worker to the client
+           Worker streams it into R2 via multipart upload (~8 MiB parts),
+           then serves the first client from R2 (full Range support).
 ```
 
+- **Outputs are cached in R2.** The Worker keys each result by
+  `sha256(sourceUrl)` under `OUTPUT_PREFIX/av1-unedited/`. Repeat requests
+  (including browser **Range**/seek requests) are served straight from R2 with
+  `Content-Length`, `Accept-Ranges`, and `206 Partial Content` — no container,
+  no re-encode.
+- **First request blocks.** On a miss the first caller waits for the full
+  encode, then is served from R2, so even the first response is seekable. The
+  R2 upload runs under `ctx.waitUntil`, so the object still lands even if that
+  caller disconnects mid-encode.
+- **No truncated caches.** The container encodes to a temp file and only
+  responds `200` (with `Content-Length`) on `ffmpeg` exit `0`; any failure is a
+  non-200, so a partial object is never stored. The Worker `abort()`s the
+  multipart upload on any stream error.
 - Before encoding, the container runs a **`curl` preflight** (`HEAD`, following
-  redirects) to confirm the source is reachable and to reject inputs whose
+  redirects) to confirm the source is reachable and reject inputs whose
   `Content-Length` exceeds **1 GiB** — both return a `500` JSON with context.
-- `-dn -map_chapters -1` keeps the output to video + audio only (the source's
+- `-dn -map_chapters -1` keeps output to video + audio only (the source's
   chapter markers would otherwise be muxed in as a stray `bin_data` text track).
-- **ffmpeg fetches the source itself** (the container has `enableInternet`),
-  so the bytes never round-trip through the Worker on the way in.
-- Output is a **fragmented MP4** (`+frag_keyframe+empty_moov`). This is what
-  lets us stream it straight out of an ffmpeg pipe — a normal MP4 needs a
-  seekable output to write its `moov` atom, which a pipe is not.
+- Output is a standard **faststart MP4** (`moov` atom at the front) for clean
+  in-browser seeking — possible because the container writes to a seekable file
+  rather than a pipe.
 
 ## Project layout
 
 | Path                      | What it is                                            |
 | ------------------------- | ----------------------------------------------------- |
-| `src/index.ts`            | The Worker + the `Transcoder` Container class         |
+| `src/index.ts`            | Worker: R2 cache + Range serving + `Transcoder` class |
 | `container_src/server.mjs`| HTTP server inside the container that drives ffmpeg   |
 | `Dockerfile`              | `node:22-alpine` + static `ffmpeg` (`libsvtav1`) + curl |
-| `wrangler.jsonc`          | Worker / container / Durable Object config            |
+| `wrangler.jsonc`          | Worker / container / DO / R2 config                   |
 
 ## Develop & deploy
 
@@ -100,7 +116,14 @@ curl -L "https://aveeone.tsmith.net/" -o out.mp4
 
 # Inspect the result (should report av1 video + aac audio, no data track):
 ffprobe out.mp4
+
+# Second request for the same source is served from R2 (x-cache: hit).
+# Range requests are satisfied from R2 with 206 Partial Content:
+curl -s -D - -r 0-99999 -o /dev/null "https://aveeone.tsmith.net/x/https://example.com/video.mp4"
 ```
+
+Responses carry an `x-cache: hit|miss` header so you can tell whether the
+object came from R2 or was freshly encoded.
 
 ## Failure behaviour
 
@@ -109,7 +132,7 @@ context as possible, e.g.:
 
 ```json
 {
-  "error": "ffmpeg exited with a non-zero status before producing output",
+  "error": "ffmpeg exited with a non-zero status",
   "stage": "ffmpeg-exit",
   "requestId": "1f0c...",
   "sourceUrl": "https://example.com/video.mp4",
@@ -119,9 +142,10 @@ context as possible, e.g.:
 ```
 
 Stages you may see: `request-validation`, `validate-source-url`,
-`container-dispatch` (Worker side) and `container-validate`, `preflight`,
-`spawn`, `ffmpeg-error`, `ffmpeg-exit`, `container-unhandled` (container side).
-The `preflight` stage covers unreachable sources and the >1 GiB size cap.
+`container-dispatch`, `generate-store`, `post-store-read` (Worker side) and
+`container-validate`, `preflight`, `spawn`, `ffmpeg-error`, `ffmpeg-exit`,
+`post-encode-stat`, `container-unhandled` (container side). The `preflight`
+stage covers unreachable sources and the >1 GiB size cap.
 
 All failures are also logged, and Workers **observability is enabled with 100%
 sampling for both logs and traces** (`wrangler.jsonc`).
@@ -131,21 +155,20 @@ sampling for both logs and traces** (`wrangler.jsonc`).
 These were deliberate choices for a first version — worth understanding before
 relying on it:
 
-1. **Synchronous + slow.** `libsvtav1 -preset 6` is much slower than realtime.
-   The client connection stays open for the entire encode, so large/long
-   videos can take minutes. There is no caching, queueing, or async job model.
+1. **First request is synchronous + slow.** `libsvtav1 -preset 6` is much slower
+   than realtime, so the first caller for a given source waits for the full
+   encode before any bytes arrive. Subsequent requests are served instantly from
+   R2. There's no queue/async job model — the first request blocks.
 
-2. **Mid-stream failures can't become a 500.** Because we stream, we commit to
-   `HTTP 200` as soon as ffmpeg emits its first byte. We delay that commit until
-   the first output byte so most failures (bad URL, unsupported/corrupt input,
-   decode errors) still return a clean 500 JSON. But if ffmpeg dies *after*
-   output has started, the response is a **truncated** MP4 — we can only `end()`
-   the stream and log the full error (look for `mid-stream-exit` in logs).
+2. **No single-flight.** Two simultaneous misses for the same source trigger two
+   encodes (last write into R2 wins). Fine for a single-user POC; a production
+   build would coordinate with a lock (e.g. a Durable Object) so concurrent
+   misses share one encode.
 
-3. **Fragmented MP4, not faststart.** The output uses fragmented MP4 so it can
-   be piped. It plays fine in browsers and most players. If you need a classic
-   single-`moov` faststart MP4, you'd buffer to disk in the container and serve
-   the whole file (higher time-to-first-byte).
+3. **Cache is never invalidated.** Objects are immutable per
+   `OUTPUT_PREFIX`/`sha256(url)` and served with a 1-year `immutable`
+   `Cache-Control`. Changing encode behaviour requires bumping `OUTPUT_PREFIX`;
+   stale objects under old prefixes are not cleaned up automatically.
 
 4. **Open transcoder / SSRF.** The Worker will fetch any `http(s)` URL it's
    given. There's no allowlist, auth, or rate limiting. Add those before
@@ -156,6 +179,27 @@ relying on it:
    We don't probe container/codecs first.
 
 ## Version History and Observations:
+
+**v0.2.0:** Added R2 output caching, fixed the range-request re-encode problem
+
+- Worker-side:
+  - Results cached in R2 (`OUTPUTS`), keyed `OUTPUT_PREFIX/av1-unedited/sha256(url)`.
+  - Cache hits served directly from R2 with `Content-Length` + `Range`/`206`
+    support, so browser seek/range requests no longer re-trigger the encode.
+  - On a miss the encode is streamed into R2 via multipart upload (~8 MiB
+    parts, memory-bounded) under `ctx.waitUntil`, then served from R2.
+  - `x-cache: hit|miss` header added for visibility.
+  - Note: the R2 key prefix stays `v0.1.0` (output is still "unedited AV1");
+    bump `OUTPUT_PREFIX` only when output semantics change.
+- Container details:
+  - FFMPEG now encodes to a temp file and only responds `200` (with
+    `Content-Length`) on a clean exit — eliminating the truncated-output and
+    "can't downgrade a 200" problems from v0.1.0.
+  - Output switched from fMP4 to a **faststart MP4** (`moov` at the front),
+    now possible because output is a seekable file rather than a pipe.
+- User experience notes:
+  - First request for a given source still blocks for the full encode; every
+    request after that is instant from R2 and fully seekable.
 
 **v0.1.0:** Initial prototype for uncached, straight AV1 encodes with minimal safeguards
 

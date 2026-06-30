@@ -15,6 +15,7 @@ import { Container, getRandom } from "@cloudflare/containers";
 
 export interface Env {
   TRANSCODER: DurableObjectNamespace<Transcoder>;
+  OUTPUTS: R2Bucket;
 }
 
 /**
@@ -29,6 +30,33 @@ const DEFAULT_SOURCE_URL = "https://assets.tsmith.net/aus-mobile.mp4";
  * proportional to POOL_SIZE rather than total request count.
  */
 const POOL_SIZE = 2;
+
+/**
+ * R2 key namespace for cached outputs.
+ *
+ * v0.1.0 produces UNEDITED assets only — a straight AV1/AAC transcode of the
+ * source with no trimming, scaling, or other edits. Bump this when the output
+ * semantics change so old cached objects aren't served under new behaviour.
+ */
+const OUTPUT_PREFIX = "v0.1.0";
+
+/** Multipart part size while streaming the encode into R2 (>= 5 MiB required). */
+const R2_PART_SIZE = 8 * 1024 * 1024;
+
+/**
+ * Derive the R2 object key for a given source URL. SHA-256 of the (normalized)
+ * URL is virtually collision-free and keeps keys fixed-length and opaque.
+ */
+async function outputKey(sourceUrl: string): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(sourceUrl),
+  );
+  const hash = [...new Uint8Array(digest)]
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+  return `${OUTPUT_PREFIX}/av1-unedited/${hash}`;
+}
 
 /**
  * The Container-backed Durable Object. One ffmpeg process runs per instance.
@@ -93,8 +121,173 @@ function extractSourceUrl(requestUrl: string): string | null {
   return source;
 }
 
+/**
+ * Serve a cached object from R2, honouring a Range request if present.
+ * Returns null if the object isn't in R2 yet.
+ */
+async function serveFromR2(
+  env: Env,
+  key: string,
+  request: Request,
+  requestId: string,
+): Promise<Response | null> {
+  // HEAD: metadata only, no body / no range slicing.
+  if (request.method === "HEAD") {
+    const meta = await env.OUTPUTS.head(key);
+    if (!meta) return null;
+    const headers = new Headers();
+    meta.writeHttpMetadata(headers);
+    headers.set("content-type", "video/mp4");
+    headers.set("content-length", String(meta.size));
+    headers.set("accept-ranges", "bytes");
+    headers.set("etag", meta.httpEtag);
+    headers.set("cache-control", "public, max-age=31536000, immutable");
+    headers.set("x-request-id", requestId);
+    headers.set("x-cache", "hit");
+    return new Response(null, { status: 200, headers });
+  }
+
+  // GET: pass the request headers so R2 parses any Range for us.
+  const object = await env.OUTPUTS.get(key, { range: request.headers });
+  if (!object) return null;
+
+  const headers = new Headers();
+  object.writeHttpMetadata(headers);
+  headers.set("content-type", "video/mp4");
+  headers.set("accept-ranges", "bytes");
+  headers.set("etag", object.httpEtag);
+  headers.set("cache-control", "public, max-age=31536000, immutable");
+  headers.set("x-request-id", requestId);
+  headers.set("x-cache", "hit");
+
+  // If the client sent a satisfiable Range, R2 populates object.range.
+  const range = object.range as { offset?: number; length?: number } | undefined;
+  const hasRange = request.headers.has("range") && range !== undefined;
+
+  if (hasRange) {
+    const offset = range!.offset ?? 0;
+    const length = range!.length ?? object.size - offset;
+    const end = offset + length - 1;
+    headers.set("content-range", `bytes ${offset}-${end}/${object.size}`);
+    headers.set("content-length", String(length));
+    return new Response(object.body, { status: 206, headers });
+  }
+
+  headers.set("content-length", String(object.size));
+  return new Response(object.body, { status: 200, headers });
+}
+
+/**
+ * Cache miss: ask a container to transcode the source, then stream the result
+ * into R2 via a multipart upload. Resolves once the object is fully committed
+ * to R2 (or throws/returns the container's error response).
+ *
+ * Memory stays bounded by R2_PART_SIZE regardless of output size, and we only
+ * `complete()` the upload on a clean end-of-stream — a mid-encode failure
+ * surfaces as a non-200 from the container (it writes to disk and only responds
+ * on ffmpeg exit 0), so a truncated object is never cached.
+ */
+async function generateAndStore(
+  env: Env,
+  key: string,
+  sourceUrl: string,
+  requestId: string,
+): Promise<{ ok: true } | { ok: false; response: Response }> {
+  const container = await getRandom(env.TRANSCODER, POOL_SIZE);
+
+  const containerRequest = new Request("http://container/transcode", {
+    method: "GET",
+    headers: {
+      "x-source-url": sourceUrl,
+      "x-request-id": requestId,
+    },
+  });
+
+  const response = await container.fetch(containerRequest);
+
+  // The container only returns 200 video/mp4 on a verified-successful encode;
+  // anything else is an error payload we pass straight through (nothing cached).
+  const contentType = response.headers.get("content-type") ?? "";
+  if (response.status !== 200 || !contentType.startsWith("video/mp4")) {
+    return { ok: false, response };
+  }
+  if (!response.body) {
+    return {
+      ok: false,
+      response: failure(500, {
+        error: "Container returned a 200 with no body",
+        stage: "generate",
+        requestId,
+        sourceUrl,
+      }),
+    };
+  }
+
+  const multipart = await env.OUTPUTS.createMultipartUpload(key, {
+    httpMetadata: { contentType: "video/mp4" },
+    customMetadata: { sourceUrl, requestId },
+  });
+
+  const parts: R2UploadedPart[] = [];
+  let buffered: Uint8Array[] = [];
+  let bufferedBytes = 0;
+  let partNumber = 1;
+
+  const flush = async (force: boolean) => {
+    if (bufferedBytes === 0) return;
+    if (!force && bufferedBytes < R2_PART_SIZE) return;
+    const chunk = new Uint8Array(bufferedBytes);
+    let offset = 0;
+    for (const b of buffered) {
+      chunk.set(b, offset);
+      offset += b.length;
+    }
+    buffered = [];
+    bufferedBytes = 0;
+    parts.push(await multipart.uploadPart(partNumber++, chunk));
+  };
+
+  try {
+    const reader = response.body.getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value && value.length > 0) {
+        buffered.push(value);
+        bufferedBytes += value.length;
+        // Flush only full parts mid-stream; the remainder becomes the last part.
+        await flush(false);
+      }
+    }
+    await flush(true); // final (possibly small) part
+    await multipart.complete(parts);
+    console.log(
+      "aveeone.cache.stored",
+      JSON.stringify({ requestId, key, parts: parts.length }),
+    );
+    return { ok: true };
+  } catch (err) {
+    // Never leave a partial object behind.
+    await multipart.abort().catch(() => {});
+    return {
+      ok: false,
+      response: failure(500, {
+        error: "Failed while streaming the transcode into R2",
+        stage: "generate-store",
+        requestId,
+        sourceUrl,
+        details: err instanceof Error ? err.message : String(err),
+      }),
+    };
+  }
+}
+
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(
+    request: Request,
+    env: Env,
+    ctx: ExecutionContext,
+  ): Promise<Response> {
     const requestId = crypto.randomUUID();
 
     if (request.method !== "GET" && request.method !== "HEAD") {
@@ -132,46 +325,56 @@ export default {
       });
     }
 
+    const sourceStr = parsedSource.toString();
+    const key = await outputKey(sourceStr);
+
     console.log(
       "aveeone.request",
-      JSON.stringify({ requestId, sourceUrl: parsedSource.toString() }),
+      JSON.stringify({ requestId, sourceUrl: sourceStr, key }),
     );
 
-    // 3. Route to a pooled container instance. getRandom() picks one of
-    //    POOL_SIZE named stubs ("transcoder-0" … "transcoder-N-1") at random,
-    //    so the alarm heartbeat fires at most POOL_SIZE times/second instead of
-    //    once per request.
     try {
-      const container = await getRandom(env.TRANSCODER, POOL_SIZE);
+      // 3. Cache hit? Serve straight from R2 (with Range support).
+      const cached = await serveFromR2(env, key, request, requestId);
+      if (cached) return cached;
 
-      // The container's HTTP server reads the source URL from this header.
-      const containerRequest = new Request("http://container/transcode", {
-        method: request.method,
-        headers: {
-          "x-source-url": parsedSource.toString(),
-          "x-request-id": requestId,
-        },
-      });
+      // HEAD on a miss doesn't trigger an encode.
+      if (request.method === "HEAD") {
+        return new Response(null, {
+          status: 404,
+          headers: { "x-request-id": requestId, "x-cache": "miss" },
+        });
+      }
 
-      // The @cloudflare/containers base class handles start + port readiness
-      // and proxies to `defaultPort`. The container returns either a streaming
-      // 200 (video/mp4) or a 500 JSON error, which we pass straight through.
-      const response = await container.fetch(containerRequest);
+      // 4. Cache miss: transcode + persist to R2, then serve from R2.
+      //    waitUntil keeps the upload alive even if the client disconnects
+      //    mid-encode, so the object still lands for the next request.
+      const task = generateAndStore(env, key, sourceStr, requestId);
+      ctx.waitUntil(task.then(() => undefined).catch(() => undefined));
 
-      // Surface the request id for tracing/debugging on the way out.
-      const headers = new Headers(response.headers);
-      headers.set("x-request-id", requestId);
-      return new Response(response.body, {
-        status: response.status,
-        statusText: response.statusText,
-        headers,
+      const result = await task;
+      if (!result.ok) return result.response;
+
+      const served = await serveFromR2(env, key, request, requestId);
+      if (served) {
+        served.headers.set("x-cache", "miss");
+        return served;
+      }
+
+      // Should be unreachable: we just stored it.
+      return failure(500, {
+        error: "Object missing from R2 immediately after store",
+        stage: "post-store-read",
+        requestId,
+        sourceUrl: sourceStr,
+        key,
       });
     } catch (err) {
       return failure(500, {
-        error: "Failed to dispatch the transcode job to a container",
+        error: "Failed to dispatch the transcode job",
         stage: "container-dispatch",
         requestId,
-        sourceUrl: parsedSource.toString(),
+        sourceUrl: sourceStr,
         details: err instanceof Error ? err.message : String(err),
       });
     }

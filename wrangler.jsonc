@@ -39,6 +39,14 @@
     }
   ],
 
+  // Cache of transcoded outputs. Keys: OUTPUT_PREFIX/av1-unedited/<sha256(url)>.
+  "r2_buckets": [
+    {
+      "binding": "OUTPUTS",
+      "bucket_name": "aveeone-prod"
+    }
+  ],
+
   // Containers are backed by Durable Objects.
   "durable_objects": {
     "bindings": [
