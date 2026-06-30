@@ -1,4 +1,4 @@
-import { Container } from "@cloudflare/containers";
+import { Container, getRandom } from "@cloudflare/containers";
 
 /**
  * Aveeone — a Cloudflare Worker that transcodes a source MP4 to AV1/AAC on the
@@ -24,15 +24,20 @@ export interface Env {
 const DEFAULT_SOURCE_URL = "https://assets.tsmith.net/aus-mobile.mp4";
 
 /**
+ * Number of long-lived container instances to maintain. getRandom() spreads
+ * requests across "transcoder-0" … "transcoder-N-1", keeping alarm noise
+ * proportional to POOL_SIZE rather than total request count.
+ */
+const POOL_SIZE = 2;
+
+/**
  * The Container-backed Durable Object. One ffmpeg process runs per instance.
  * `enableInternet` is required so ffmpeg can fetch the source video directly.
  */
 export class Transcoder extends Container<Env> {
   // The HTTP server inside the container listens here (see container_src/server.mjs).
   defaultPort = 8080;
-  // ffmpeg can run far longer than realtime for AV1; keep the instance warm a
-  // while, but the per-request keepalive in the container guards long encodes.
-  sleepAfter = "10m";
+  sleepAfter = "5m";
   // Required: the container must reach the public internet to pull the source.
   enableInternet = true;
 }
@@ -132,10 +137,12 @@ export default {
       JSON.stringify({ requestId, sourceUrl: parsedSource.toString() }),
     );
 
-    // 3. Hand the job to a fresh container instance (one ffmpeg per instance).
-    //    A unique id gives us per-job isolation up to `max_instances`.
+    // 3. Route to a pooled container instance. getRandom() picks one of
+    //    POOL_SIZE named stubs ("transcoder-0" … "transcoder-N-1") at random,
+    //    so the alarm heartbeat fires at most POOL_SIZE times/second instead of
+    //    once per request.
     try {
-      const container = env.TRANSCODER.getByName(requestId);
+      const container = await getRandom(env.TRANSCODER, POOL_SIZE);
 
       // The container's HTTP server reads the source URL from this header.
       const containerRequest = new Request("http://container/transcode", {
