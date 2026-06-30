@@ -18,6 +18,12 @@ export interface Env {
 }
 
 /**
+ * Fallback source used when the request path doesn't include a source URL.
+ * Doubles as the default test footage.
+ */
+const DEFAULT_SOURCE_URL = "https://assets.tsmith.net/aus-mobile.mp4";
+
+/**
  * The Container-backed Durable Object. One ffmpeg process runs per instance.
  * `enableInternet` is required so ffmpeg can fetch the source video directly.
  */
@@ -95,17 +101,9 @@ export default {
       });
     }
 
-    // 1. Parse the source URL out of the path.
-    const sourceUrl = extractSourceUrl(request.url);
-    if (!sourceUrl) {
-      return failure(500, {
-        error:
-          "Could not extract a source URL. Expected /<anything>/<https-url-to-mp4>.",
-        stage: "parse-source-url",
-        requestId,
-        requestUrl: request.url,
-      });
-    }
+    // 1. Parse the source URL out of the path. If none is present, fall back
+    //    to the default test footage.
+    const sourceUrl = extractSourceUrl(request.url) ?? DEFAULT_SOURCE_URL;
 
     // 2. Validate it's a fetchable absolute http(s) URL.
     let parsedSource: URL;

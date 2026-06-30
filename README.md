@@ -15,12 +15,18 @@ https://<host>/<ARBITRARY_TEXT>/<SOURCE_URL>
 
 - `<ARBITRARY_TEXT>` is where transform options would normally go. **This
   project ignores it** (no options/flags are supported).
-- `<SOURCE_URL>` is the full `http(s)` URL of the source MP4.
+- `<SOURCE_URL>` is the full `http(s)` URL of the source MP4. If omitted, a
+  default test clip (`https://assets.tsmith.net/aus-mobile.mp4`) is used.
+
+Deployed at **https://aveeone.tsmith.net** (custom domain).
 
 ### Example
 
 ```
-https://aveeone.<account>.workers.dev/transform/https://example.com/video.mp4
+https://aveeone.tsmith.net/transform/https://example.com/video.mp4
+
+# No source URL -> transcodes the default test footage:
+https://aveeone.tsmith.net/
 ```
 
 ## How it works
@@ -30,19 +36,26 @@ client ──▶ Worker (src/index.ts)
                 │  parses source URL from the path
                 │  validates it's http(s)
                 ▼
-          Container DO "Transcoder"  (one ffmpeg per instance)
+           Container DO "Transcoder"  (one ffmpeg per instance)
                 │  container_src/server.mjs receives X-Source-Url
+                │  curl preflight: reachable? size <= 1 GiB?  (else 500)
                 ▼
-          ffmpeg -i <SOURCE_URL>
-                  -c:v libsvtav1 -preset 6 -crf 26
-                  -c:a aac
-                  -movflags +frag_keyframe+empty_moov+default_base_moof
-                  -f mp4 pipe:1
+           ffmpeg -i <SOURCE_URL>
+                   -c:v libsvtav1 -preset 6 -crf 26
+                   -c:a aac
+                   -dn -map_chapters -1
+                   -movflags +frag_keyframe+empty_moov+default_base_moof
+                   -f mp4 pipe:1
                 │  stdout (fragmented MP4)
                 ▼
-          streamed back through the Worker to the client
+           streamed back through the Worker to the client
 ```
 
+- Before encoding, the container runs a **`curl` preflight** (`HEAD`, following
+  redirects) to confirm the source is reachable and to reject inputs whose
+  `Content-Length` exceeds **1 GiB** — both return a `500` JSON with context.
+- `-dn -map_chapters -1` keeps the output to video + audio only (the source's
+  chapter markers would otherwise be muxed in as a stray `bin_data` text track).
 - **ffmpeg fetches the source itself** (the container has `enableInternet`),
   so the bytes never round-trip through the Worker on the way in.
 - Output is a **fragmented MP4** (`+frag_keyframe+empty_moov`). This is what
@@ -55,7 +68,7 @@ client ──▶ Worker (src/index.ts)
 | ------------------------- | ----------------------------------------------------- |
 | `src/index.ts`            | The Worker + the `Transcoder` Container class         |
 | `container_src/server.mjs`| HTTP server inside the container that drives ffmpeg   |
-| `Dockerfile`              | Node + static `ffmpeg` (with `libsvtav1`) image       |
+| `Dockerfile`              | `node:22-alpine` + static `ffmpeg` (`libsvtav1`) + curl |
 | `wrangler.jsonc`          | Worker / container / Durable Object config            |
 
 ## Develop & deploy
@@ -77,12 +90,15 @@ npm run deploy
 ### Try it
 
 ```bash
-# Replace with your deployed host and a real source MP4 URL.
+# Transcode a specific source:
 curl -L \
-  "https://aveeone.<account>.workers.dev/x/https://test-videos.co.uk/sample.mp4" \
+  "https://aveeone.tsmith.net/x/https://example.com/video.mp4" \
   -o out.mp4
 
-# Inspect the result (should report av1 video + aac audio):
+# Or just hit the root to transcode the default test footage:
+curl -L "https://aveeone.tsmith.net/" -o out.mp4
+
+# Inspect the result (should report av1 video + aac audio, no data track):
 ffprobe out.mp4
 ```
 
@@ -102,12 +118,13 @@ context as possible, e.g.:
 }
 ```
 
-Stages you may see: `request-validation`, `parse-source-url`,
-`validate-source-url`, `container-dispatch` (Worker side) and
-`container-validate`, `spawn`, `ffmpeg-error`, `ffmpeg-exit` (container side).
+Stages you may see: `request-validation`, `validate-source-url`,
+`container-dispatch` (Worker side) and `container-validate`, `preflight`,
+`spawn`, `ffmpeg-error`, `ffmpeg-exit`, `container-unhandled` (container side).
+The `preflight` stage covers unreachable sources and the >1 GiB size cap.
 
 All failures are also logged, and Workers **observability is enabled with 100%
-trace sampling** (`wrangler.jsonc`).
+sampling for both logs and traces** (`wrangler.jsonc`).
 
 ## Known trade-offs & limitations
 
@@ -132,7 +149,8 @@ relying on it:
 
 4. **Open transcoder / SSRF.** The Worker will fetch any `http(s)` URL it's
    given. There's no allowlist, auth, or rate limiting. Add those before
-   exposing this publicly.
+   exposing this publicly. (The 1 GiB preflight cap only limits size, not
+   destination.)
 
 5. **No input verification.** We assume the source is a video ffmpeg can read.
    We don't probe container/codecs first.

@@ -9,9 +9,97 @@
 // (no TypeScript build step).
 
 import { createServer } from "node:http";
-import { spawn } from "node:child_process";
+import { spawn, execFile } from "node:child_process";
 
 const PORT = Number(process.env.PORT) || 8080;
+
+// Reject sources larger than this before we bother spawning ffmpeg.
+const MAX_INPUT_BYTES = 1024 * 1024 * 1024; // 1 GiB
+
+/**
+ * Preflight the source URL with curl before transcoding:
+ *  - confirm it's reachable (final HTTP status is 2xx after following redirects)
+ *  - reject inputs whose Content-Length exceeds MAX_INPUT_BYTES
+ *
+ * Resolves with { httpCode, contentLength } on success, or rejects with an
+ * Error carrying a `.info` payload describing the failure.
+ */
+function preflightSource(sourceUrl) {
+  return new Promise((resolve, reject) => {
+    // -s silent, -I HEAD, -L follow redirects. We capture the final status and
+    // downloaded content-length via curl's -w template so we don't have to
+    // parse multiple redirect header blocks ourselves.
+    const args = [
+      "-sIL",
+      "--max-time",
+      "20",
+      "-o",
+      "/dev/null",
+      "-w",
+      "%{http_code} %{size_download} %{header_json}",
+      sourceUrl,
+    ];
+
+    execFile("curl", args, { maxBuffer: 4 * 1024 * 1024 }, (err, stdout) => {
+      if (err) {
+        const e = new Error("Source URL is not accessible");
+        e.info = {
+          error: "Source URL is not accessible (curl preflight failed)",
+          stage: "preflight",
+          details: err.message,
+        };
+        return reject(e);
+      }
+
+      // stdout: "<http_code> <size_download> <header_json>"
+      const firstSpace = stdout.indexOf(" ");
+      const secondSpace = stdout.indexOf(" ", firstSpace + 1);
+      const httpCode = Number(stdout.slice(0, firstSpace));
+      const headerJsonRaw = stdout.slice(secondSpace + 1).trim();
+
+      if (!Number.isFinite(httpCode) || httpCode < 200 || httpCode >= 400) {
+        const e = new Error("Source URL not reachable");
+        e.info = {
+          error: "Source URL did not return a successful status",
+          stage: "preflight",
+          httpCode,
+        };
+        return reject(e);
+      }
+
+      // Pull Content-Length out of the (case-insensitive) header JSON map.
+      // curl's header_json values are arrays of strings.
+      let contentLength = null;
+      try {
+        const headers = JSON.parse(headerJsonRaw);
+        for (const [key, value] of Object.entries(headers)) {
+          if (key.toLowerCase() === "content-length") {
+            const raw = Array.isArray(value) ? value[value.length - 1] : value;
+            const parsed = Number(raw);
+            if (Number.isFinite(parsed)) contentLength = parsed;
+            break;
+          }
+        }
+      } catch {
+        // No usable header JSON; we proceed but can't enforce the size cap.
+      }
+
+      if (contentLength !== null && contentLength > MAX_INPUT_BYTES) {
+        const e = new Error("Source too large");
+        e.info = {
+          error: "Source exceeds the maximum allowed input size",
+          stage: "preflight",
+          httpCode,
+          contentLength,
+          maxInputBytes: MAX_INPUT_BYTES,
+        };
+        return reject(e);
+      }
+
+      resolve({ httpCode, contentLength });
+    });
+  });
+}
 
 // ffmpeg encode settings are fixed per the project spec (no options/flags).
 // Input options go *before* -i. We add reconnect options for resilience when
@@ -40,6 +128,12 @@ function buildFfmpegArgs(sourceUrl) {
     // Audio: AAC
     "-c:a",
     "aac",
+    // Drop data streams, and drop chapters. Chapters from the source are
+    // otherwise written by the MP4 muxer as a "text"/bin_data track (which -dn
+    // does not remove), so we strip them explicitly to keep output to v+a only.
+    "-dn",
+    "-map_chapters",
+    "-1",
     // Fragmented MP4 so the moov atom isn't required at the end -> streamable
     // out of a pipe (no seekable output / faststart needed).
     "-movflags",
@@ -62,7 +156,7 @@ function sendJsonError(res, status, info) {
   console.error("aveeone.container.failure", JSON.stringify(info));
 }
 
-function handleTranscode(req, res) {
+async function handleTranscode(req, res) {
   const sourceUrl = req.headers["x-source-url"];
   const requestId = req.headers["x-request-id"] || "unknown";
 
@@ -78,6 +172,22 @@ function handleTranscode(req, res) {
   if (req.method === "HEAD") {
     res.writeHead(200, { "content-type": "video/mp4" });
     return res.end();
+  }
+
+  // Preflight: confirm the source is reachable and not too large *before* we
+  // commit to spawning ffmpeg and streaming a response.
+  try {
+    const { httpCode, contentLength } = await preflightSource(sourceUrl);
+    console.log(
+      "aveeone.container.preflight",
+      JSON.stringify({ requestId, sourceUrl, httpCode, contentLength }),
+    );
+  } catch (err) {
+    return sendJsonError(res, 500, {
+      ...(err && err.info ? err.info : { error: String(err), stage: "preflight" }),
+      requestId,
+      sourceUrl,
+    });
   }
 
   const args = buildFfmpegArgs(sourceUrl);
@@ -208,7 +318,16 @@ const server = createServer((req, res) => {
   }
 
   if (url.pathname === "/transcode") {
-    return handleTranscode(req, res);
+    handleTranscode(req, res).catch((err) => {
+      // Last-resort guard; handleTranscode handles its own errors, but never
+      // let a rejection go unhandled.
+      sendJsonError(res, 500, {
+        error: "Unhandled transcode error",
+        stage: "container-unhandled",
+        details: err instanceof Error ? err.message : String(err),
+      });
+    });
+    return;
   }
 
   res.writeHead(404, { "content-type": "application/json; charset=utf-8" });

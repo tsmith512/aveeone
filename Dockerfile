@@ -4,11 +4,20 @@
 FROM mwader/static-ffmpeg:7.1 AS ffmpeg
 
 # --- runtime stage ----------------------------------------------------------
-FROM node:22-slim
+# Alpine for a small image. The static ffmpeg binary is fully self-contained,
+# so it runs fine on musl/Alpine. We add curl for the source preflight check.
+FROM node:22-alpine
 
-# Bring in the static ffmpeg/ffprobe binaries (no extra system libs needed).
+# curl is used for the source preflight check (reachability + size cap).
+# Prefer HTTPS repos; fall back to HTTP if a TLS-intercepting proxy makes the
+# Alpine CDN cert untrusted (common on corporate networks / Docker Desktop).
+RUN apk add --no-cache curl \
+ || ( sed -i 's|https://|http://|g' /etc/apk/repositories && apk add --no-cache curl )
+
+# Bring in the static ffmpeg binary (no extra system libs needed). ffprobe is
+# intentionally omitted: the server only invokes ffmpeg, and dropping ffprobe
+# removes a large (~70 MB) image layer.
 COPY --from=ffmpeg /ffmpeg /usr/local/bin/ffmpeg
-COPY --from=ffmpeg /ffprobe /usr/local/bin/ffprobe
 
 WORKDIR /app
 

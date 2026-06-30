@@ -5,10 +5,27 @@
   "compatibility_date": "2025-03-07",
   "compatibility_flags": ["nodejs_compat"],
 
-  // Observability on with 100% trace sampling, per project requirements.
+  // Serve from a custom domain (Cloudflare creates/manages the DNS + cert).
+  // The zone tsmith.net must be on this Cloudflare account.
+  "routes": [
+    {
+      "pattern": "aveeone.tsmith.net",
+      "custom_domain": true
+    }
+  ],
+
+  // Observability on with 100% sampling, including distributed traces.
   "observability": {
     "enabled": true,
-    "head_sampling_rate": 1
+    "head_sampling_rate": 1,
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1
+    },
+    "traces": {
+      "enabled": true,
+      "head_sampling_rate": 1
+    }
   },
 
   // The ffmpeg container, built from ./Dockerfile. AV1 encoding is CPU-heavy,
