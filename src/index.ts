@@ -229,22 +229,16 @@ async function generateAndStore(
   });
 
   const parts: R2UploadedPart[] = [];
-  let buffered: Uint8Array[] = [];
-  let bufferedBytes = 0;
   let partNumber = 1;
 
-  const flush = async (force: boolean) => {
-    if (bufferedBytes === 0) return;
-    if (!force && bufferedBytes < R2_PART_SIZE) return;
-    const chunk = new Uint8Array(bufferedBytes);
-    let offset = 0;
-    for (const b of buffered) {
-      chunk.set(b, offset);
-      offset += b.length;
-    }
-    buffered = [];
-    bufferedBytes = 0;
-    parts.push(await multipart.uploadPart(partNumber++, chunk));
+  // Accumulate bytes and emit parts of EXACTLY R2_PART_SIZE. R2 requires all
+  // non-trailing parts to be the same length; only the final part may differ.
+  let pending = new Uint8Array(0);
+  const append = (chunk: Uint8Array) => {
+    const merged = new Uint8Array(pending.length + chunk.length);
+    merged.set(pending, 0);
+    merged.set(chunk, pending.length);
+    pending = merged;
   };
 
   try {
@@ -253,13 +247,22 @@ async function generateAndStore(
       const { done, value } = await reader.read();
       if (done) break;
       if (value && value.length > 0) {
-        buffered.push(value);
-        bufferedBytes += value.length;
-        // Flush only full parts mid-stream; the remainder becomes the last part.
-        await flush(false);
+        append(value);
+        // Drain as many full, fixed-size parts as we have.
+        while (pending.length >= R2_PART_SIZE) {
+          const part = pending.slice(0, R2_PART_SIZE);
+          pending = pending.slice(R2_PART_SIZE);
+          parts.push(await multipart.uploadPart(partNumber++, part));
+        }
       }
     }
-    await flush(true); // final (possibly small) part
+    // Final (trailing) part may be any size; only upload if there's data left.
+    if (pending.length > 0) {
+      parts.push(await multipart.uploadPart(partNumber++, pending));
+    }
+    if (parts.length === 0) {
+      throw new Error("Encode produced no output bytes");
+    }
     await multipart.complete(parts);
     console.log(
       "aveeone.cache.stored",
