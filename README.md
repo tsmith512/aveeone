@@ -13,8 +13,10 @@ The URL scheme mirrors
 https://<host>/<ARBITRARY_TEXT>/<SOURCE_URL>
 ```
 
-- `<ARBITRARY_TEXT>` is where transform options would normally go. **This
-  project ignores it** (no options/flags are supported).
+- `<ARBITRARY_TEXT>` is where transform options will eventually go. It's not
+  yet interpreted, but it **is part of the cache key** — changing it forces a
+  fresh transcode (a manual cache bust today; the basis for edit parameters
+  later).
 - `<SOURCE_URL>` is the full `http(s)` URL of the source MP4. If omitted, a
   default test clip (`https://assets.tsmith.net/aus-mobile.mp4`) is used.
 
@@ -34,7 +36,7 @@ https://aveeone.tsmith.net/
 ```
 client ──▶ Worker (src/index.ts)
                 │  parse + validate source URL from the path
-                │  key = OUTPUT_PREFIX/av1-unedited/sha256(sourceUrl)
+                │  key = OUTPUT_PREFIX/av1-unedited/sha256(options + sourceUrl)
                 ▼
            R2 "OUTPUTS"  ──hit──▶  serve object (Content-Length, Range/206)
                 │
@@ -57,7 +59,8 @@ client ──▶ Worker (src/index.ts)
 ```
 
 - **Outputs are cached in R2.** The Worker keys each result by
-  `sha256(sourceUrl)` under `OUTPUT_PREFIX/av1-unedited/`. Repeat requests
+  `sha256(options + sourceUrl)` under `OUTPUT_PREFIX/av1-unedited/`, so the
+  `<ARBITRARY_TEXT>` segment participates in the cache identity. Repeat requests
   (including browser **Range**/seek requests) are served straight from R2 with
   `Content-Length`, `Accept-Ranges`, and `206 Partial Content` — no container,
   no re-encode.

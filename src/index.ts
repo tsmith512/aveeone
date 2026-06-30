@@ -44,13 +44,17 @@ const OUTPUT_PREFIX = "v0.1.0";
 const R2_PART_SIZE = 8 * 1024 * 1024;
 
 /**
- * Derive the R2 object key for a given source URL. SHA-256 of the (normalized)
- * URL is virtually collision-free and keeps keys fixed-length and opaque.
+ * Derive the R2 object key for a request. The hash covers BOTH the options
+ * segment (ARBITRARY_TEXT) and the source URL, so changing the options changes
+ * the key — a cache bust today, and the cache identity for edit parameters once
+ * ARBITRARY_TEXT is wired into ffmpeg. SHA-256 is virtually collision-free and
+ * keeps keys fixed-length and opaque. The "\n" separator is unambiguous because
+ * a path segment can't contain a newline.
  */
-async function outputKey(sourceUrl: string): Promise<string> {
+async function outputKey(options: string, sourceUrl: string): Promise<string> {
   const digest = await crypto.subtle.digest(
     "SHA-256",
-    new TextEncoder().encode(sourceUrl),
+    new TextEncoder().encode(`${options}\n${sourceUrl}`),
   );
   const hash = [...new Uint8Array(digest)]
     .map((b) => b.toString(16).padStart(2, "0"))
@@ -88,22 +92,38 @@ function failure(status: number, info: FailureInfo): Response {
 }
 
 /**
- * Extract the source URL from the request path.
+ * Parse the request path into its two components:
+ *
+ *   /<options>/<source-url>
+ *
+ * - `options` is the first path segment (ARBITRARY_TEXT). Today it's opaque and
+ *   only used as a cache key input (a cache bust); later it carries ffmpeg edit
+ *   parameters.
+ * - `sourceUrl` is everything after it, or null if absent (caller substitutes
+ *   the default footage).
  *
  * `URL.pathname` preserves the literal `https://...` (it does not collapse the
  * `//`), and any query string on the source lives in `url.search`, so we
  * reconstruct the full source URL from both.
  */
-function extractSourceUrl(requestUrl: string): string | null {
+function parseRequestPath(requestUrl: string): {
+  options: string;
+  sourceUrl: string | null;
+} {
   const url = new URL(requestUrl);
 
-  // Drop the leading "/", then split off the first segment (ARBITRARY_TEXT).
+  // Drop the leading "/", then split off the first segment (the options).
   const afterLeadingSlash = url.pathname.replace(/^\/+/, "");
   const firstSlash = afterLeadingSlash.indexOf("/");
-  if (firstSlash === -1) return null; // no source URL component present
 
+  if (firstSlash === -1) {
+    // Only a single segment (or none): treat it as options with no source URL.
+    return { options: afterLeadingSlash, sourceUrl: null };
+  }
+
+  const options = afterLeadingSlash.slice(0, firstSlash);
   let source = afterLeadingSlash.slice(firstSlash + 1);
-  if (source.length === 0) return null;
+  if (source.length === 0) return { options, sourceUrl: null };
 
   // Re-attach the source's own query string, if any.
   source += url.search;
@@ -118,7 +138,7 @@ function extractSourceUrl(requestUrl: string): string | null {
     }
   }
 
-  return source;
+  return { options, sourceUrl: source };
 }
 
 /**
@@ -302,9 +322,10 @@ export default {
       });
     }
 
-    // 1. Parse the source URL out of the path. If none is present, fall back
-    //    to the default test footage.
-    const sourceUrl = extractSourceUrl(request.url) ?? DEFAULT_SOURCE_URL;
+    // 1. Parse the path into its options segment + source URL. If no source URL
+    //    is present, fall back to the default test footage.
+    const { options, sourceUrl: parsedUrl } = parseRequestPath(request.url);
+    const sourceUrl = parsedUrl ?? DEFAULT_SOURCE_URL;
 
     // 2. Validate it's a fetchable absolute http(s) URL.
     let parsedSource: URL;
@@ -329,11 +350,11 @@ export default {
     }
 
     const sourceStr = parsedSource.toString();
-    const key = await outputKey(sourceStr);
+    const key = await outputKey(options, sourceStr);
 
     console.log(
       "aveeone.request",
-      JSON.stringify({ requestId, sourceUrl: sourceStr, key }),
+      JSON.stringify({ requestId, options, sourceUrl: sourceStr, key }),
     );
 
     try {
