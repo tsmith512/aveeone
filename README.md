@@ -154,3 +154,26 @@ relying on it:
 
 5. **No input verification.** We assume the source is a video ffmpeg can read.
    We don't probe container/codecs first.
+
+## Version History and Observations:
+
+**v0.1.0:** Initial prototype for uncached, straight AV1 encodes with minimal safeguards
+
+- Worker-side:
+  - Used a pool size of 2 containers
+  - Only 1GB input size check
+- Container details:
+  - FFMPEG streamed out an fMP4 to the Worker, which streamed it directly to users
+  - On a `standard-4`, realtime factor was ~3.5x.
+    [A 15 second input](https://assets.tsmith.net/aus-mobile.mp4) would return
+    in about 40 seconds.
+- User experience notes:
+  - Because the result was uncached, and previewing in a browser like Chrome
+    makes shorter range requests over a video, playback was essentially broken
+    until after first _watch_.
+  - Because ffmpeg output is streamed directly, if ffmpeg _starts,_ the HTTP
+    status is 200 because we have to commit to begin the response. So if ffmpeg
+    errors after the initial stream starts, we'll have no way to know the video
+    didn't complete.
+  - fMP4 should be as broadly compatible as AV1, but a faststart MP4 would be
+    moderately better from a technical perspective.
