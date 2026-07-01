@@ -1,9 +1,14 @@
 // Aveeone container server.
 //
-// A tiny HTTP server that the Worker talks to. For each /transcode request the
-// Worker fetches the source on its own fast network and POSTs the body here.
-// The container pipes it straight into ffmpeg stdin — no network download
-// inside the container. Output is written to a temp file then streamed back.
+// Implements the job-descriptor pattern: the Worker sends a GET /transcode
+// request with x-source-url, and this server runs ffmpeg to fetch and encode
+// that URL directly. This is the standard model for transcoding services —
+// the container receives a job description (URL + encode parameters) and is
+// fully responsible for fetching its inputs and producing its output.
+//
+// Output is written to a seekable temp file (required for +faststart) and
+// streamed back to the Worker once ffmpeg exits cleanly. The Worker uploads
+// to R2 and serves from there; this container never touches R2 directly.
 //
 // Written as plain ESM JS so the container image needs only Node + ffmpeg
 // (no TypeScript build step).
@@ -26,18 +31,25 @@ try {
   console.log("aveeone.container.startup", JSON.stringify({ nproc }));
 } catch { /* non-fatal */ }
 
-// ffmpeg encode settings. Source arrives via stdin (pipe:0) — the Worker
-// fetches the source on its fast network and POSTs the body to us, which we
-// pipe straight into ffmpeg. No reconnect args needed; no URL required.
-// Output is written to a seekable temp file so we can use +faststart.
-function buildFfmpegArgs(outPath) {
+// Build the ffmpeg argument list for a given source URL and output path.
+// Input options (before -i) handle resilient HTTP fetching; output options
+// produce a seekable faststart MP4 on disk.
+function buildFfmpegArgs(sourceUrl, outPath) {
   return [
     "-hide_banner",
     "-loglevel",
     "error",
     "-y", // overwrite the (pre-generated unique) temp path if it exists
+    // Resilient HTTP source fetch. ffmpeg's native HTTP client handles
+    // redirects, reconnects, and range requests (e.g. moov-at-end recovery).
+    "-reconnect",
+    "1",
+    "-reconnect_streamed",
+    "1",
+    "-reconnect_delay_max",
+    "2",
     "-i",
-    "pipe:0", // read source from stdin
+    sourceUrl,
     // Video: AV1 via SVT-AV1. lp=4 pins SVT-AV1's logical-processor count to
     // the standard-4 instance's vCPU allocation. Without this, SVT-AV1 reads
     // nproc (which reflects the host's physical core count inside a CF
@@ -82,8 +94,16 @@ function sendJsonError(res, status, info) {
 }
 
 async function handleTranscode(req, res) {
-  const sourceUrl = req.headers["x-source-url"] || "(unknown)";
+  const sourceUrl = req.headers["x-source-url"];
   const requestId = req.headers["x-request-id"] || "unknown";
+
+  if (!sourceUrl || typeof sourceUrl !== "string") {
+    return sendJsonError(res, 500, {
+      error: "Missing x-source-url header",
+      stage: "container-validate",
+      requestId,
+    });
+  }
 
   // HEAD: report the content type without doing any work.
   if (req.method === "HEAD") {
@@ -91,19 +111,11 @@ async function handleTranscode(req, res) {
     return res.end();
   }
 
-  if (req.method !== "POST") {
-    return sendJsonError(res, 500, {
-      error: "Expected POST with source body",
-      stage: "container-validate",
-      requestId,
-    });
-  }
-
-  // Encode to a unique temp file. We only respond once ffmpeg has fully and
-  // successfully written the file, so the Worker gets a clean 200-on-success
-  // contract (with Content-Length) and never caches a truncated object.
+  // Encode to a unique temp file. Responding only on ffmpeg exit 0 gives the
+  // Worker a clean success/failure contract and ensures nothing partial is
+  // ever uploaded to R2.
   const outPath = join(tmpdir(), `aveeone-${randomUUID()}.mp4`);
-  const args = buildFfmpegArgs(outPath);
+  const args = buildFfmpegArgs(sourceUrl, outPath);
   const spawnedAt = Date.now();
   console.log(
     "aveeone.container.spawn",
@@ -112,8 +124,7 @@ async function handleTranscode(req, res) {
 
   let ffmpeg;
   try {
-    // stdin=pipe so we can feed it the source body from the request.
-    ffmpeg = spawn("ffmpeg", args, { stdio: ["pipe", "ignore", "pipe"] });
+    ffmpeg = spawn("ffmpeg", args, { stdio: ["ignore", "ignore", "pipe"] });
   } catch (err) {
     await unlink(outPath).catch(() => {});
     return sendJsonError(res, 500, {
@@ -124,14 +135,6 @@ async function handleTranscode(req, res) {
       details: err instanceof Error ? err.message : String(err),
     });
   }
-
-  // Pipe the POST body (the source file) into ffmpeg stdin. Errors on stdin
-  // (e.g. upstream body truncated) will cause ffmpeg to exit non-zero, which
-  // we handle below. Destroy stdin explicitly when the request body ends so
-  // ffmpeg knows input is complete.
-  req.pipe(ffmpeg.stdin);
-  req.on("error", () => ffmpeg.stdin.destroy());
-  ffmpeg.stdin.on("error", () => {}); // suppress EPIPE if ffmpeg exits early
 
   // Ring-ish buffer of the most recent stderr output, for error reporting.
   let stderrTail = "";

@@ -213,19 +213,62 @@ async function generateAndStore(
   sourceUrl: string,
   requestId: string,
 ): Promise<{ ok: true } | { ok: false; response: Response }> {
-  // Fetch the source here in the Worker. Worker network to CF-hosted resources
-  // (R2, etc.) is fast and unthrottled; the container's network interface is
-  // the bottleneck (~0.7 MB/s observed), so keeping the download in the Worker
-  // and piping the body to the container cuts ~37s off a 28 MB source fetch.
+  // Preflight: HEAD request to confirm the source is reachable and within the
+  // size limit before committing a container to the job. The Worker's network
+  // reaches CF-hosted sources (R2, etc.) in ~130ms; this check is cheap.
+  //
+  // @TODO: some origins return 405 for HEAD or omit Content-Length. Currently
+  // we skip the checks that can't be satisfied and proceed to transcode. A
+  // future improvement could try a Range: bytes=0-0 GET as a fallback to at
+  // least confirm reachability when HEAD is not supported.
   const fetchStart = Date.now();
-  let sourceResponse: Response;
   try {
-    sourceResponse = await fetch(sourceUrl);
+    const preflight = await fetch(sourceUrl, { method: "HEAD" });
+    const fetchElapsedMs = Date.now() - fetchStart;
+
+    if (preflight.status === 405) {
+      // Origin doesn't support HEAD — skip checks and let ffmpeg try directly.
+      console.log("aveeone.preflight.skip", JSON.stringify({
+        requestId, sourceUrl, reason: "HEAD 405", fetchElapsedMs,
+      }));
+    } else if (!preflight.ok) {
+      return {
+        ok: false,
+        response: failure(500, {
+          error: "Source URL returned a non-2xx status",
+          stage: "preflight",
+          requestId,
+          sourceUrl,
+          httpStatus: preflight.status,
+        }),
+      };
+    } else {
+      const contentLength = Number(preflight.headers.get("content-length") ?? 0);
+      if (contentLength > 0 && contentLength > MAX_SOURCE_BYTES) {
+        return {
+          ok: false,
+          response: failure(500, {
+            error: "Source exceeds the maximum allowed input size",
+            stage: "preflight",
+            requestId,
+            sourceUrl,
+            contentLength,
+            maxInputBytes: MAX_SOURCE_BYTES,
+          }),
+        };
+      }
+      // @TODO: if contentLength === 0 the origin didn't send Content-Length;
+      // size cap cannot be enforced. Could use Range: bytes=0-0 to at least
+      // confirm reachability and get the true size from Content-Range.
+      console.log("aveeone.preflight.ok", JSON.stringify({
+        requestId, sourceUrl, contentLength: contentLength || null, fetchElapsedMs,
+      }));
+    }
   } catch (err) {
     return {
       ok: false,
       response: failure(500, {
-        error: "Failed to fetch source URL",
+        error: "Source preflight request failed",
         stage: "preflight",
         requestId,
         sourceUrl,
@@ -234,51 +277,16 @@ async function generateAndStore(
     };
   }
 
-  if (!sourceResponse.ok) {
-    await sourceResponse.body?.cancel();
-    return {
-      ok: false,
-      response: failure(500, {
-        error: "Source URL returned a non-2xx status",
-        stage: "preflight",
-        requestId,
-        sourceUrl,
-        httpStatus: sourceResponse.status,
-      }),
-    };
-  }
-
-  const contentLength = Number(sourceResponse.headers.get("content-length") ?? 0);
-  if (contentLength > 0 && contentLength > MAX_SOURCE_BYTES) {
-    await sourceResponse.body?.cancel();
-    return {
-      ok: false,
-      response: failure(500, {
-        error: "Source exceeds the maximum allowed input size",
-        stage: "preflight",
-        requestId,
-        sourceUrl,
-        contentLength,
-        maxInputBytes: MAX_SOURCE_BYTES,
-      }),
-    };
-  }
-
-  const fetchElapsedMs = Date.now() - fetchStart;
-  console.log(
-    "aveeone.timing.fetch",
-    JSON.stringify({ requestId, sourceUrl, contentLength, fetchElapsedMs }),
-  );
-
-  // POST the source body directly to the container. The container pipes it into
-  // ffmpeg stdin — no network download needed inside the container.
+  // Dispatch the job to a pooled container instance. The container fetches the
+  // source URL directly with ffmpeg — the standard job-descriptor pattern for a
+  // transcoding service (URL in, encoded file out). ffmpeg's native HTTP client
+  // handles reconnects and HTTP-level seeking (e.g. moov-at-end recovery).
   const container = await getRandom(env.TRANSCODER, POOL_SIZE);
   const containerRequest = new Request("http://container/transcode", {
-    method: "POST",
-    body: sourceResponse.body,
+    method: "GET",
     headers: {
+      "x-source-url": sourceUrl,
       "x-request-id": requestId,
-      "x-source-url": sourceUrl, // kept for logging inside the container
     },
   });
 
