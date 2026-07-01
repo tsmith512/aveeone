@@ -34,6 +34,9 @@
     {
       "class_name": "Transcoder",
       "image": "./Dockerfile",
+      // NB: ffmpeg config in container_src/server.mjs explicity sets vCPU count
+      // for AV1 encoder to 4, which is the vCPU provision here. If you change
+      // instance size, change the `lp` value there.
       "instance_type": "standard-4",
       "max_instances": 10
     }

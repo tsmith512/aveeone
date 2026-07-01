@@ -220,7 +220,9 @@ async function generateAndStore(
     },
   });
 
+  const containerStart = Date.now();
   const response = await container.fetch(containerRequest);
+  const containerElapsedMs = Date.now() - containerStart;
 
   // The container only returns 200 video/mp4 on a verified-successful encode;
   // anything else is an error payload we pass straight through (nothing cached).
@@ -228,6 +230,15 @@ async function generateAndStore(
   if (response.status !== 200 || !contentType.startsWith("video/mp4")) {
     return { ok: false, response };
   }
+
+  // Log the phase breakdown: container (preflight+download+encode+faststart),
+  // nproc inside the container, and ffmpeg's own elapsed time within that.
+  const ffmpegElapsedMs = Number(response.headers.get("x-ffmpeg-elapsed-ms") ?? 0);
+  const nproc = response.headers.get("x-nproc") ?? "unknown";
+  console.log(
+    "aveeone.timing.container",
+    JSON.stringify({ requestId, containerElapsedMs, ffmpegElapsedMs, nproc }),
+  );
   if (!response.body) {
     return {
       ok: false,
@@ -258,6 +269,7 @@ async function generateAndStore(
     pending = merged;
   };
 
+  const r2Start = Date.now();
   try {
     const reader = response.body.getReader();
     for (;;) {
@@ -281,9 +293,10 @@ async function generateAndStore(
       throw new Error("Encode produced no output bytes");
     }
     await multipart.complete(parts);
+    const r2ElapsedMs = Date.now() - r2Start;
     console.log(
       "aveeone.cache.stored",
-      JSON.stringify({ requestId, key, parts: parts.length }),
+      JSON.stringify({ requestId, key, parts: parts.length, r2ElapsedMs }),
     );
     return { ok: true };
   } catch (err) {

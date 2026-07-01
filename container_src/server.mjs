@@ -18,6 +18,14 @@ import { randomUUID } from "node:crypto";
 
 const PORT = Number(process.env.PORT) || 8080;
 
+// Log the visible CPU count once at startup so we can confirm what SVT-AV1
+// sees inside the CF container (nproc may reflect host cores, not vCPU quota).
+import { execSync } from "node:child_process";
+try {
+  const nproc = execSync("nproc", { encoding: "utf8" }).trim();
+  console.log("aveeone.container.startup", JSON.stringify({ nproc }));
+} catch { /* non-fatal */ }
+
 // Reject sources larger than this before we bother spawning ffmpeg.
 const MAX_INPUT_BYTES = 1024 * 1024 * 1024; // 1 GiB
 
@@ -115,7 +123,8 @@ function buildFfmpegArgs(sourceUrl, outPath) {
   return [
     "-hide_banner",
     "-loglevel",
-    "error",
+    "info", // temporarily verbose to capture SVT-AV1 core count + progress
+
     "-y", // overwrite the (pre-generated unique) temp path if it exists
     // Resilience for the network source:
     "-reconnect",
@@ -126,13 +135,19 @@ function buildFfmpegArgs(sourceUrl, outPath) {
     "2",
     "-i",
     sourceUrl,
-    // Video: AV1 via SVT-AV1
+    // Video: AV1 via SVT-AV1. lp=4 pins SVT-AV1's logical-processor count to
+    // the standard-4 instance's vCPU allocation. Without this, SVT-AV1 reads
+    // nproc (which reflects the host's physical core count inside a CF
+    // container, not the 4-vCPU quota) and spawns far too many threads,
+    // causing heavy scheduler contention and ~4x slower encodes.
     "-c:v",
     "libsvtav1",
     "-preset",
     "6",
     "-crf",
     "26",
+    "-svtav1-params",
+    "lp=4",
     // Audio: AAC
     "-c:a",
     "aac",
@@ -152,7 +167,7 @@ function buildFfmpegArgs(sourceUrl, outPath) {
   ];
 }
 
-const MAX_STDERR_BYTES = 64 * 1024; // keep the tail of ffmpeg stderr for errors
+const MAX_STDERR_BYTES = 256 * 1024; // temporarily larger to capture full SVT-AV1 info block
 
 function sendJsonError(res, status, info) {
   const body = JSON.stringify(info, null, 2);
@@ -203,6 +218,7 @@ async function handleTranscode(req, res) {
   // contract (with Content-Length) and never caches a truncated object.
   const outPath = join(tmpdir(), `aveeone-${randomUUID()}.mp4`);
   const args = buildFfmpegArgs(sourceUrl, outPath);
+  const spawnedAt = Date.now();
   console.log(
     "aveeone.container.spawn",
     JSON.stringify({ requestId, sourceUrl, outPath }),
@@ -278,15 +294,27 @@ async function handleTranscode(req, res) {
     });
   }
 
+  const ffmpegElapsedMs = Date.now() - spawnedAt;
+  // Log the SVT-AV1 info block (visible at loglevel=info) so we can read the
+  // actual logical core count and confirm lp inside the CF environment.
+  const svtLines = stderrTail
+    .split("\n")
+    .filter((l) => l.includes("Svt[info]") || l.includes("Svt[warn]"))
+    .join("\n");
   console.log(
     "aveeone.container.done",
-    JSON.stringify({ requestId, sourceUrl, size }),
+    JSON.stringify({ requestId, sourceUrl, size, ffmpegElapsedMs }),
   );
+  if (svtLines) {
+    console.log("aveeone.container.svtinfo", svtLines);
+  }
 
   res.writeHead(200, {
     "content-type": "video/mp4",
     "content-length": String(size),
     "x-request-id": String(requestId),
+    "x-ffmpeg-elapsed-ms": String(ffmpegElapsedMs),
+    "x-nproc": String(execSync("nproc", { encoding: "utf8" }).trim()),
     "cache-control": "no-store",
   });
 
