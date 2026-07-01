@@ -183,6 +183,28 @@ relying on it:
 
 ## Version History and Observations:
 
+**v0.2.1:** Performance investigation
+
+- Problem: 15s sample input routinely took 1.5-2 minutes to return when cold
+- Hypothesis: vCPU count misreported to ffmpeg, incorrect parallelization
+- Observations:
+  - vCPU count was correct within the container
+    - Encoding time on sample still ~20s before and after `lp` change
+  - Network IO on input and output are unexpectedly high
+    - Network IO appeared constrained to 0.75MB/s
+    - ~40s original fetch, ~30s derivative put
+- Mitigations attempted:
+  - Hardcoding `lp=4` (vCPU count) did not change encoding performance.
+  - Attempted having Worker fetch the input then pipe to Container via HTTP POST,
+    instead of having ffmpeg fetch. No change to input-side timing.
+- Worker-side
+  - Preflight HEAD check now happens in the Worker
+- Container details:
+  - Reverted input fetch back to the container for more standard workload
+  - Retained the `lp=4` hardcoded parallelization flag
+- User experience notes:
+  - No changes
+
 **v0.2.0:** Added R2 output caching, fixed the range-request re-encode problem
 
 - Worker-side:
@@ -204,7 +226,7 @@ relying on it:
   - In a browser, this means any followup range requests are served near-instantly.
 - Measured changes:
   - Cache hit: Download of the encoded sample took 1.3 seconds (21MB)
-  - Cache miss on a container cold start: 1:50 - 1:55
+  - Cache miss on a container cold start: 1:50 - 1:55 (with a max of 17:45!)
   - Cache miss on a running container: 1:25 - 1:45
 
 **v0.1.0:** Initial prototype for uncached, straight AV1 encodes with minimal safeguards
