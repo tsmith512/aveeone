@@ -40,6 +40,9 @@ const OUTPUT_PREFIX = "gen1";
 /** Multipart part size while streaming the encode into R2 (>= 5 MiB required). */
 const R2_PART_SIZE = 8 * 1024 * 1024;
 
+/** Maximum accepted source file size (enforced in the Worker before the container sees it). */
+const MAX_SOURCE_BYTES = 1024 * 1024 * 1024; // 1 GiB
+
 /**
  * Derive the R2 object key for a request. The hash covers BOTH the options
  * segment (ARBITRARY_TEXT) and the source URL, so changing the options changes
@@ -210,13 +213,72 @@ async function generateAndStore(
   sourceUrl: string,
   requestId: string,
 ): Promise<{ ok: true } | { ok: false; response: Response }> {
-  const container = await getRandom(env.TRANSCODER, POOL_SIZE);
+  // Fetch the source here in the Worker. Worker network to CF-hosted resources
+  // (R2, etc.) is fast and unthrottled; the container's network interface is
+  // the bottleneck (~0.7 MB/s observed), so keeping the download in the Worker
+  // and piping the body to the container cuts ~37s off a 28 MB source fetch.
+  const fetchStart = Date.now();
+  let sourceResponse: Response;
+  try {
+    sourceResponse = await fetch(sourceUrl);
+  } catch (err) {
+    return {
+      ok: false,
+      response: failure(500, {
+        error: "Failed to fetch source URL",
+        stage: "preflight",
+        requestId,
+        sourceUrl,
+        details: err instanceof Error ? err.message : String(err),
+      }),
+    };
+  }
 
+  if (!sourceResponse.ok) {
+    await sourceResponse.body?.cancel();
+    return {
+      ok: false,
+      response: failure(500, {
+        error: "Source URL returned a non-2xx status",
+        stage: "preflight",
+        requestId,
+        sourceUrl,
+        httpStatus: sourceResponse.status,
+      }),
+    };
+  }
+
+  const contentLength = Number(sourceResponse.headers.get("content-length") ?? 0);
+  if (contentLength > 0 && contentLength > MAX_SOURCE_BYTES) {
+    await sourceResponse.body?.cancel();
+    return {
+      ok: false,
+      response: failure(500, {
+        error: "Source exceeds the maximum allowed input size",
+        stage: "preflight",
+        requestId,
+        sourceUrl,
+        contentLength,
+        maxInputBytes: MAX_SOURCE_BYTES,
+      }),
+    };
+  }
+
+  const fetchElapsedMs = Date.now() - fetchStart;
+  console.log(
+    "aveeone.timing.fetch",
+    JSON.stringify({ requestId, sourceUrl, contentLength, fetchElapsedMs }),
+  );
+
+  // POST the source body directly to the container. The container pipes it into
+  // ffmpeg stdin — no network download needed inside the container.
+  const container = await getRandom(env.TRANSCODER, POOL_SIZE);
   const containerRequest = new Request("http://container/transcode", {
-    method: "GET",
+    method: "POST",
+    body: sourceResponse.body,
     headers: {
-      "x-source-url": sourceUrl,
       "x-request-id": requestId,
+      "x-source-url": sourceUrl, // kept for logging inside the container
     },
   });
 
@@ -231,14 +293,14 @@ async function generateAndStore(
     return { ok: false, response };
   }
 
-  // Log the phase breakdown: container (preflight+download+encode+faststart),
-  // nproc inside the container, and ffmpeg's own elapsed time within that.
+  // Log the phase breakdown visible from the Worker side.
   const ffmpegElapsedMs = Number(response.headers.get("x-ffmpeg-elapsed-ms") ?? 0);
   const nproc = response.headers.get("x-nproc") ?? "unknown";
   console.log(
     "aveeone.timing.container",
     JSON.stringify({ requestId, containerElapsedMs, ffmpegElapsedMs, nproc }),
   );
+
   if (!response.body) {
     return {
       ok: false,

@@ -1,15 +1,15 @@
 // Aveeone container server.
 //
-// A tiny HTTP server that the Worker talks to. For each /transcode request it
-// spawns ffmpeg, which fetches the source URL itself and transcodes to
-// AV1 (libsvtav1) / AAC, emitting a *fragmented* MP4 to stdout so it can be
-// streamed straight back through the Worker as the HTTP response body.
+// A tiny HTTP server that the Worker talks to. For each /transcode request the
+// Worker fetches the source on its own fast network and POSTs the body here.
+// The container pipes it straight into ffmpeg stdin — no network download
+// inside the container. Output is written to a temp file then streamed back.
 //
 // Written as plain ESM JS so the container image needs only Node + ffmpeg
 // (no TypeScript build step).
 
 import { createServer } from "node:http";
-import { spawn, execFile } from "node:child_process";
+import { spawn } from "node:child_process";
 import { createReadStream } from "node:fs";
 import { stat, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -19,122 +19,25 @@ import { randomUUID } from "node:crypto";
 const PORT = Number(process.env.PORT) || 8080;
 
 // Log the visible CPU count once at startup so we can confirm what SVT-AV1
-// sees inside the CF container (nproc may reflect host cores, not vCPU quota).
+// sees inside the CF container.
 import { execSync } from "node:child_process";
 try {
   const nproc = execSync("nproc", { encoding: "utf8" }).trim();
   console.log("aveeone.container.startup", JSON.stringify({ nproc }));
 } catch { /* non-fatal */ }
 
-// Reject sources larger than this before we bother spawning ffmpeg.
-const MAX_INPUT_BYTES = 1024 * 1024 * 1024; // 1 GiB
-
-/**
- * Preflight the source URL with curl before transcoding:
- *  - confirm it's reachable (final HTTP status is 2xx after following redirects)
- *  - reject inputs whose Content-Length exceeds MAX_INPUT_BYTES
- *
- * Resolves with { httpCode, contentLength } on success, or rejects with an
- * Error carrying a `.info` payload describing the failure.
- */
-function preflightSource(sourceUrl) {
-  return new Promise((resolve, reject) => {
-    // -s silent, -I HEAD, -L follow redirects. We capture the final status and
-    // downloaded content-length via curl's -w template so we don't have to
-    // parse multiple redirect header blocks ourselves.
-    const args = [
-      "-sIL",
-      "--max-time",
-      "20",
-      "-o",
-      "/dev/null",
-      "-w",
-      "%{http_code} %{size_download} %{header_json}",
-      sourceUrl,
-    ];
-
-    execFile("curl", args, { maxBuffer: 4 * 1024 * 1024 }, (err, stdout) => {
-      if (err) {
-        const e = new Error("Source URL is not accessible");
-        e.info = {
-          error: "Source URL is not accessible (curl preflight failed)",
-          stage: "preflight",
-          details: err.message,
-        };
-        return reject(e);
-      }
-
-      // stdout: "<http_code> <size_download> <header_json>"
-      const firstSpace = stdout.indexOf(" ");
-      const secondSpace = stdout.indexOf(" ", firstSpace + 1);
-      const httpCode = Number(stdout.slice(0, firstSpace));
-      const headerJsonRaw = stdout.slice(secondSpace + 1).trim();
-
-      if (!Number.isFinite(httpCode) || httpCode < 200 || httpCode >= 400) {
-        const e = new Error("Source URL not reachable");
-        e.info = {
-          error: "Source URL did not return a successful status",
-          stage: "preflight",
-          httpCode,
-        };
-        return reject(e);
-      }
-
-      // Pull Content-Length out of the (case-insensitive) header JSON map.
-      // curl's header_json values are arrays of strings.
-      let contentLength = null;
-      try {
-        const headers = JSON.parse(headerJsonRaw);
-        for (const [key, value] of Object.entries(headers)) {
-          if (key.toLowerCase() === "content-length") {
-            const raw = Array.isArray(value) ? value[value.length - 1] : value;
-            const parsed = Number(raw);
-            if (Number.isFinite(parsed)) contentLength = parsed;
-            break;
-          }
-        }
-      } catch {
-        // No usable header JSON; we proceed but can't enforce the size cap.
-      }
-
-      if (contentLength !== null && contentLength > MAX_INPUT_BYTES) {
-        const e = new Error("Source too large");
-        e.info = {
-          error: "Source exceeds the maximum allowed input size",
-          stage: "preflight",
-          httpCode,
-          contentLength,
-          maxInputBytes: MAX_INPUT_BYTES,
-        };
-        return reject(e);
-      }
-
-      resolve({ httpCode, contentLength });
-    });
-  });
-}
-
-// ffmpeg encode settings are fixed per the project spec (no options/flags).
-// Input options go *before* -i. We add reconnect options for resilience when
-// pulling the source over http(s). Output is written to a seekable file so we
-// can use +faststart (moov atom at the front) for clean VOD seeking; the
-// finished file is then streamed to the Worker and uploaded to R2.
-function buildFfmpegArgs(sourceUrl, outPath) {
+// ffmpeg encode settings. Source arrives via stdin (pipe:0) — the Worker
+// fetches the source on its fast network and POSTs the body to us, which we
+// pipe straight into ffmpeg. No reconnect args needed; no URL required.
+// Output is written to a seekable temp file so we can use +faststart.
+function buildFfmpegArgs(outPath) {
   return [
     "-hide_banner",
     "-loglevel",
-    "info", // temporarily verbose to capture SVT-AV1 core count + progress
-
+    "error",
     "-y", // overwrite the (pre-generated unique) temp path if it exists
-    // Resilience for the network source:
-    "-reconnect",
-    "1",
-    "-reconnect_streamed",
-    "1",
-    "-reconnect_delay_max",
-    "2",
     "-i",
-    sourceUrl,
+    "pipe:0", // read source from stdin
     // Video: AV1 via SVT-AV1. lp=4 pins SVT-AV1's logical-processor count to
     // the standard-4 instance's vCPU allocation. Without this, SVT-AV1 reads
     // nproc (which reflects the host's physical core count inside a CF
@@ -167,11 +70,10 @@ function buildFfmpegArgs(sourceUrl, outPath) {
   ];
 }
 
-const MAX_STDERR_BYTES = 256 * 1024; // temporarily larger to capture full SVT-AV1 info block
+const MAX_STDERR_BYTES = 64 * 1024;
 
 function sendJsonError(res, status, info) {
   const body = JSON.stringify(info, null, 2);
-  // Only set headers if we haven't already started streaming a 200.
   if (!res.headersSent) {
     res.writeHead(status, { "content-type": "application/json; charset=utf-8" });
   }
@@ -180,16 +82,8 @@ function sendJsonError(res, status, info) {
 }
 
 async function handleTranscode(req, res) {
-  const sourceUrl = req.headers["x-source-url"];
+  const sourceUrl = req.headers["x-source-url"] || "(unknown)";
   const requestId = req.headers["x-request-id"] || "unknown";
-
-  if (!sourceUrl || typeof sourceUrl !== "string") {
-    return sendJsonError(res, 500, {
-      error: "Missing X-Source-Url header",
-      stage: "container-validate",
-      requestId,
-    });
-  }
 
   // HEAD: report the content type without doing any work.
   if (req.method === "HEAD") {
@@ -197,19 +91,11 @@ async function handleTranscode(req, res) {
     return res.end();
   }
 
-  // Preflight: confirm the source is reachable and not too large *before* we
-  // commit to spawning ffmpeg and streaming a response.
-  try {
-    const { httpCode, contentLength } = await preflightSource(sourceUrl);
-    console.log(
-      "aveeone.container.preflight",
-      JSON.stringify({ requestId, sourceUrl, httpCode, contentLength }),
-    );
-  } catch (err) {
+  if (req.method !== "POST") {
     return sendJsonError(res, 500, {
-      ...(err && err.info ? err.info : { error: String(err), stage: "preflight" }),
+      error: "Expected POST with source body",
+      stage: "container-validate",
       requestId,
-      sourceUrl,
     });
   }
 
@@ -217,7 +103,7 @@ async function handleTranscode(req, res) {
   // successfully written the file, so the Worker gets a clean 200-on-success
   // contract (with Content-Length) and never caches a truncated object.
   const outPath = join(tmpdir(), `aveeone-${randomUUID()}.mp4`);
-  const args = buildFfmpegArgs(sourceUrl, outPath);
+  const args = buildFfmpegArgs(outPath);
   const spawnedAt = Date.now();
   console.log(
     "aveeone.container.spawn",
@@ -226,7 +112,8 @@ async function handleTranscode(req, res) {
 
   let ffmpeg;
   try {
-    ffmpeg = spawn("ffmpeg", args, { stdio: ["ignore", "ignore", "pipe"] });
+    // stdin=pipe so we can feed it the source body from the request.
+    ffmpeg = spawn("ffmpeg", args, { stdio: ["pipe", "ignore", "pipe"] });
   } catch (err) {
     await unlink(outPath).catch(() => {});
     return sendJsonError(res, 500, {
@@ -237,6 +124,14 @@ async function handleTranscode(req, res) {
       details: err instanceof Error ? err.message : String(err),
     });
   }
+
+  // Pipe the POST body (the source file) into ffmpeg stdin. Errors on stdin
+  // (e.g. upstream body truncated) will cause ffmpeg to exit non-zero, which
+  // we handle below. Destroy stdin explicitly when the request body ends so
+  // ffmpeg knows input is complete.
+  req.pipe(ffmpeg.stdin);
+  req.on("error", () => ffmpeg.stdin.destroy());
+  ffmpeg.stdin.on("error", () => {}); // suppress EPIPE if ffmpeg exits early
 
   // Ring-ish buffer of the most recent stderr output, for error reporting.
   let stderrTail = "";
@@ -295,19 +190,10 @@ async function handleTranscode(req, res) {
   }
 
   const ffmpegElapsedMs = Date.now() - spawnedAt;
-  // Log the SVT-AV1 info block (visible at loglevel=info) so we can read the
-  // actual logical core count and confirm lp inside the CF environment.
-  const svtLines = stderrTail
-    .split("\n")
-    .filter((l) => l.includes("Svt[info]") || l.includes("Svt[warn]"))
-    .join("\n");
   console.log(
     "aveeone.container.done",
     JSON.stringify({ requestId, sourceUrl, size, ffmpegElapsedMs }),
   );
-  if (svtLines) {
-    console.log("aveeone.container.svtinfo", svtLines);
-  }
 
   res.writeHead(200, {
     "content-type": "video/mp4",
