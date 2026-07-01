@@ -26,19 +26,16 @@ const DEFAULT_SOURCE_URL = "https://assets.tsmith.net/aus-mobile.mp4";
 
 /**
  * Number of long-lived container instances to maintain. getRandom() spreads
- * requests across "transcoder-0" … "transcoder-N-1", keeping alarm noise
- * proportional to POOL_SIZE rather than total request count.
+ * requests across "transcoder-0" … "transcoder-N-1".
  */
 const POOL_SIZE = 2;
 
 /**
- * R2 key namespace for cached outputs.
+ * R2 key namespace for cached outputs by project generation.
  *
- * v0.1.0 produces UNEDITED assets only — a straight AV1/AAC transcode of the
- * source with no trimming, scaling, or other edits. Bump this when the output
- * semantics change so old cached objects aren't served under new behaviour.
+ * gen1 - produces UNEDITED assets only, only in AC1/AAC
  */
-const OUTPUT_PREFIX = "v0.1.0";
+const OUTPUT_PREFIX = "gen1";
 
 /** Multipart part size while streaming the encode into R2 (>= 5 MiB required). */
 const R2_PART_SIZE = 8 * 1024 * 1024;

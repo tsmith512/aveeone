@@ -186,23 +186,26 @@ relying on it:
 **v0.2.0:** Added R2 output caching, fixed the range-request re-encode problem
 
 - Worker-side:
-  - Results cached in R2 (`OUTPUTS`), keyed `OUTPUT_PREFIX/av1-unedited/sha256(url)`.
-  - Cache hits served directly from R2 with `Content-Length` + `Range`/`206`
-    support, so browser seek/range requests no longer re-trigger the encode.
-  - On a miss the encode is streamed into R2 via multipart upload (~8 MiB
-    parts, memory-bounded) under `ctx.waitUntil`, then served from R2.
-  - `x-cache: hit|miss` header added for visibility.
-  - Note: the R2 key prefix stays `v0.1.0` (output is still "unedited AV1");
-    bump `OUTPUT_PREFIX` only when output semantics change.
+  - Added a "cache" bucket with R2 (`OUTPUTS`), based on hash of request (text +
+    URL).
+  - Cache hits served directly from R2, with `Content-Length` and `Range` support.
+  - On a miss, the encode is streamed into R2 via multipart upload, then served
+    from R2 directly.
+    - `x-cache: hit|miss` header added for visibility.
 - Container details:
-  - FFMPEG now encodes to a temp file and only responds `200` (with
+  - FFMPEG now encodes to a local temp file and only responds `200` (with
     `Content-Length`) on a clean exit — eliminating the truncated-output and
     "can't downgrade a 200" problems from v0.1.0.
   - Output switched from fMP4 to a **faststart MP4** (`moov` at the front),
     now possible because output is a seekable file rather than a pipe.
 - User experience notes:
-  - First request for a given source still blocks for the full encode; every
-    request after that is instant from R2 and fully seekable.
+  - First request for a given source still blocks for the full encode, which is
+    slower. But every request after that is instant from R2 and fully seekable.
+  - In a browser, this means any followup range requests are served near-instantly.
+- Measured changes:
+  - Cache hit: Download of the encoded sample took 1.3 seconds (21MB)
+  - Cache miss on a container cold start: 1:50 - 1:55
+  - Cache miss on a running container: 1:25 - 1:45
 
 **v0.1.0:** Initial prototype for uncached, straight AV1 encodes with minimal safeguards
 
@@ -214,6 +217,7 @@ relying on it:
   - On a `standard-4`, realtime factor was ~3.5x.
     [A 15 second input](https://assets.tsmith.net/aus-mobile.mp4) would return
     in about 40 seconds.
+    - **NB: This may have been TTFB, not time to completion.**
 - User experience notes:
   - Because the result was uncached, and previewing in a browser like Chrome
     makes shorter range requests over a video, playback was essentially broken
