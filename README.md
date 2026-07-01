@@ -87,7 +87,7 @@ client ──▶ Worker (src/index.ts)
 | ------------------------- | ----------------------------------------------------- |
 | `src/index.ts`            | Worker: R2 cache + Range serving + `Transcoder` class |
 | `container_src/server.mjs`| HTTP server inside the container that drives ffmpeg   |
-| `Dockerfile`              | `node:22-alpine` + static `ffmpeg` (`libsvtav1`) + curl |
+| `Dockerfile`              | `node:22-alpine` + static `ffmpeg` (`libsvtav1`)        |
 | `wrangler.jsonc`          | Worker / container / DO / R2 config                   |
 
 ## Develop & deploy
@@ -105,6 +105,24 @@ npm run deploy
 
 > Deploying containers requires Docker available locally for the image build,
 > and a Cloudflare account with Containers (beta) enabled.
+
+### Container image cache gotcha
+
+`wrangler deploy` detects whether the container image needs a rebuild by
+hashing the **Dockerfile** — it does not hash the files `COPY`'d into the
+image. This means changes to `container_src/server.mjs` (the only file copied
+in) are **silently ignored** and the old container code keeps running.
+
+Whenever you change `container_src/server.mjs`, force a fresh image before
+deploying:
+
+```bash
+docker build --no-cache .   # rebuild without layer cache
+npm run deploy              # push the new image + deploy the Worker
+```
+
+If `wrangler deploy` shows `Image already exists remotely, skipping push` when
+you expected a container change to take effect, this is why.
 
 ### Try it
 
