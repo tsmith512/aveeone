@@ -281,18 +281,20 @@ async function generateAndStore(
   // source URL directly with ffmpeg — the standard job-descriptor pattern for a
   // transcoding service (URL in, encoded file out). ffmpeg's native HTTP client
   // handles reconnects and HTTP-level seeking (e.g. moov-at-end recovery).
+  const dispatchedAt = Date.now();
   const container = await getRandom(env.TRANSCODER, POOL_SIZE);
   const containerRequest = new Request("http://container/transcode", {
     method: "GET",
     headers: {
       "x-source-url": sourceUrl,
       "x-request-id": requestId,
+      // Used by the container to measure cold-start + routing latency.
+      "x-dispatched-at": String(dispatchedAt),
     },
   });
 
-  const containerStart = Date.now();
   const response = await container.fetch(containerRequest);
-  const containerElapsedMs = Date.now() - containerStart;
+  const uploadStart = Date.now();
 
   // The container only returns 200 video/mp4 on a verified-successful encode;
   // anything else is an error payload we pass straight through (nothing cached).
@@ -300,14 +302,6 @@ async function generateAndStore(
   if (response.status !== 200 || !contentType.startsWith("video/mp4")) {
     return { ok: false, response };
   }
-
-  // Log the phase breakdown visible from the Worker side.
-  const ffmpegElapsedMs = Number(response.headers.get("x-ffmpeg-elapsed-ms") ?? 0);
-  const nproc = response.headers.get("x-nproc") ?? "unknown";
-  console.log(
-    "aveeone.timing.container",
-    JSON.stringify({ requestId, containerElapsedMs, ffmpegElapsedMs, nproc }),
-  );
 
   if (!response.body) {
     return {
@@ -320,6 +314,14 @@ async function generateAndStore(
       }),
     };
   }
+
+  // Read timing headers the container populated for the consolidated log below.
+  const containerStartMs   = Number(response.headers.get("x-container-start-ms") || 0) || null;
+  const downloadElapsedMs  = Number(response.headers.get("x-download-elapsed-ms") || 0);
+  const encodeElapsedMs    = Number(response.headers.get("x-encode-elapsed-ms")   || 0);
+  const inputBytes         = Number(response.headers.get("x-input-size")          || 0);
+  const outputBytes        = Number(response.headers.get("content-length")        || 0);
+  const nproc              = response.headers.get("x-nproc") ?? "unknown";
 
   const multipart = await env.OUTPUTS.createMultipartUpload(key, {
     httpMetadata: { contentType: "video/mp4" },
@@ -339,7 +341,6 @@ async function generateAndStore(
     pending = merged;
   };
 
-  const r2Start = Date.now();
   try {
     const reader = response.body.getReader();
     for (;;) {
@@ -347,7 +348,6 @@ async function generateAndStore(
       if (done) break;
       if (value && value.length > 0) {
         append(value);
-        // Drain as many full, fixed-size parts as we have.
         while (pending.length >= R2_PART_SIZE) {
           const part = pending.slice(0, R2_PART_SIZE);
           pending = pending.slice(R2_PART_SIZE);
@@ -355,7 +355,6 @@ async function generateAndStore(
         }
       }
     }
-    // Final (trailing) part may be any size; only upload if there's data left.
     if (pending.length > 0) {
       parts.push(await multipart.uploadPart(partNumber++, pending));
     }
@@ -363,14 +362,24 @@ async function generateAndStore(
       throw new Error("Encode produced no output bytes");
     }
     await multipart.complete(parts);
-    const r2ElapsedMs = Date.now() - r2Start;
-    console.log(
-      "aveeone.cache.stored",
-      JSON.stringify({ requestId, key, parts: parts.length, r2ElapsedMs }),
-    );
+    const uploadElapsedMs = Date.now() - uploadStart;
+
+    // Single structured timing event covering the full encode pipeline.
+    // containerStartMs is null when x-dispatched-at was not echoed (old image).
+    console.log("aveeone.timing", JSON.stringify({
+      requestId,
+      sourceUrl,
+      containerStartMs,   // cold-start + routing: ~0 when warm, ~2-3s on cold start
+      downloadElapsedMs,  // source fetch inside the container
+      encodeElapsedMs,    // ffmpeg wall-clock time
+      uploadElapsedMs,    // container→Worker stream + R2 multipart write
+      inputBytes,         // source file size (bytes)
+      outputBytes,        // encoded output size (bytes)
+      nproc,
+    }));
+
     return { ok: true };
   } catch (err) {
-    // Never leave a partial object behind.
     await multipart.abort().catch(() => {});
     return {
       ok: false,

@@ -6,6 +6,11 @@
 // the container receives a job description (URL + encode parameters) and is
 // fully responsible for fetching its inputs and producing its output.
 //
+// Encode pipeline:
+//   1. Download source → temp file  (measured: x-download-elapsed-ms)
+//   2. ffmpeg local-file → temp file  (measured: x-encode-elapsed-ms)
+//   3. Stream output back to Worker, which uploads to R2
+//
 // Output is written to a seekable temp file (required for +faststart) and
 // streamed back to the Worker once ffmpeg exits cleanly. The Worker uploads
 // to R2 and serves from there; this container never touches R2 directly.
@@ -15,8 +20,10 @@
 
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
-import { createReadStream } from "node:fs";
+import { createReadStream, createWriteStream } from "node:fs";
 import { stat, unlink } from "node:fs/promises";
+import { pipeline } from "node:stream/promises";
+import { Readable } from "node:stream";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -26,35 +33,26 @@ const PORT = Number(process.env.PORT) || 8080;
 // Log the visible CPU count once at startup so we can confirm what SVT-AV1
 // sees inside the CF container.
 import { execSync } from "node:child_process";
-try {
-  const nproc = execSync("nproc", { encoding: "utf8" }).trim();
-  console.log("aveeone.container.startup", JSON.stringify({ nproc }));
-} catch { /* non-fatal */ }
+const NPROC = (() => {
+  try { return execSync("nproc", { encoding: "utf8" }).trim(); }
+  catch { return "unknown"; }
+})();
+console.log("aveeone.container.startup", JSON.stringify({ nproc: NPROC }));
 
-// Build the ffmpeg argument list for a given source URL and output path.
-// Input options (before -i) handle resilient HTTP fetching; output options
-// produce a seekable faststart MP4 on disk.
-function buildFfmpegArgs(sourceUrl, outPath) {
+// Build the ffmpeg argument list. Both input and output are local temp files:
+// downloading separately gives us a clean download-vs-encode time split, and
+// a local input lets ffmpeg seek freely (required for some source formats).
+function buildFfmpegArgs(inPath, outPath) {
   return [
     "-hide_banner",
     "-loglevel",
     "error",
-    "-y", // overwrite the (pre-generated unique) temp path if it exists
-    // Resilient HTTP source fetch. ffmpeg's native HTTP client handles
-    // redirects, reconnects, and range requests (e.g. moov-at-end recovery).
-    "-reconnect",
-    "1",
-    "-reconnect_streamed",
-    "1",
-    "-reconnect_delay_max",
-    "2",
+    "-y",
     "-i",
-    sourceUrl,
-    // Video: AV1 via SVT-AV1. lp=4 pins SVT-AV1's logical-processor count to
-    // the standard-4 instance's vCPU allocation. Without this, SVT-AV1 reads
-    // nproc (which reflects the host's physical core count inside a CF
-    // container, not the 4-vCPU quota) and spawns far too many threads,
-    // causing heavy scheduler contention and ~4x slower encodes.
+    inPath,
+    // Video: AV1 via SVT-AV1. lp=4 pins the logical-processor count to the
+    // standard-4 vCPU allocation (nproc inside CF containers may report the
+    // host's physical count, causing over-threading on a 4-vCPU machine).
     "-c:v",
     "libsvtav1",
     "-preset",
@@ -66,14 +64,13 @@ function buildFfmpegArgs(sourceUrl, outPath) {
     // Audio: AAC
     "-c:a",
     "aac",
-    // Drop data streams, and drop chapters. Chapters from the source are
-    // otherwise written by the MP4 muxer as a "text"/bin_data track (which -dn
-    // does not remove), so we strip them explicitly to keep output to v+a only.
+    // Drop data streams and chapter markers. Chapters are otherwise muxed into
+    // the output as a stray bin_data text track that -dn alone won't remove.
     "-dn",
     "-map_chapters",
     "-1",
-    // Standard (non-fragmented) MP4 with the moov atom relocated to the front
-    // for fast start / seeking. Requires a seekable output, hence the temp file.
+    // Standard faststart MP4 (moov at the front). Requires seekable output,
+    // hence the temp file rather than a pipe.
     "-movflags",
     "+faststart",
     "-f",
@@ -93,9 +90,58 @@ function sendJsonError(res, status, info) {
   console.error("aveeone.container.failure", JSON.stringify(info));
 }
 
+/**
+ * Download sourceUrl to a temp file using Node's native fetch.
+ * Returns { inPath, downloadElapsedMs, inputSize } or throws with an `.info`
+ * property describing the failure for sendJsonError.
+ */
+async function downloadSource(sourceUrl, requestId) {
+  const inPath = join(tmpdir(), `aveeone-in-${randomUUID()}.mp4`);
+  const dlStart = Date.now();
+
+  let srcResp;
+  try {
+    srcResp = await fetch(sourceUrl);
+  } catch (err) {
+    const e = new Error("Failed to fetch source URL");
+    e.info = { error: e.message, stage: "download", requestId, sourceUrl,
+               details: err instanceof Error ? err.message : String(err) };
+    throw e;
+  }
+
+  if (!srcResp.ok) {
+    const e = new Error("Source returned a non-2xx status");
+    e.info = { error: e.message, stage: "download", requestId, sourceUrl,
+               httpStatus: srcResp.status };
+    throw e;
+  }
+
+  // Stream response body → temp file using Node's pipeline utility.
+  // Readable.fromWeb converts the Web ReadableStream to a Node Readable.
+  try {
+    await pipeline(Readable.fromWeb(srcResp.body), createWriteStream(inPath));
+  } catch (err) {
+    await unlink(inPath).catch(() => {});
+    const e = new Error("Failed to write source to disk");
+    e.info = { error: e.message, stage: "download", requestId, sourceUrl,
+               details: err instanceof Error ? err.message : String(err) };
+    throw e;
+  }
+
+  const downloadElapsedMs = Date.now() - dlStart;
+  const { size: inputSize } = await stat(inPath);
+
+  return { inPath, downloadElapsedMs, inputSize };
+}
+
 async function handleTranscode(req, res) {
   const sourceUrl = req.headers["x-source-url"];
   const requestId = req.headers["x-request-id"] || "unknown";
+  // x-dispatched-at is set by the Worker immediately before container.fetch().
+  // The delta (Date.now() - dispatchedAt) captures container cold-start time
+  // plus internal routing — close to 0 when warm, ~2-3s on a cold start.
+  const dispatchedAt = Number(req.headers["x-dispatched-at"] ?? 0);
+  const containerStartMs = dispatchedAt > 0 ? Date.now() - dispatchedAt : null;
 
   if (!sourceUrl || typeof sourceUrl !== "string") {
     return sendJsonError(res, 500, {
@@ -111,21 +157,31 @@ async function handleTranscode(req, res) {
     return res.end();
   }
 
-  // Encode to a unique temp file. Responding only on ffmpeg exit 0 gives the
-  // Worker a clean success/failure contract and ensures nothing partial is
-  // ever uploaded to R2.
-  const outPath = join(tmpdir(), `aveeone-${randomUUID()}.mp4`);
-  const args = buildFfmpegArgs(sourceUrl, outPath);
-  const spawnedAt = Date.now();
+  // --- Phase 1: download source to temp file ---
+  let inPath, downloadElapsedMs, inputSize;
+  try {
+    ({ inPath, downloadElapsedMs, inputSize } = await downloadSource(sourceUrl, requestId));
+  } catch (err) {
+    return sendJsonError(res, 500, {
+      ...(err.info ?? { error: String(err), stage: "download" }),
+    });
+  }
   console.log(
-    "aveeone.container.spawn",
-    JSON.stringify({ requestId, sourceUrl, outPath }),
+    "aveeone.container.download",
+    JSON.stringify({ requestId, sourceUrl, inputSize, downloadElapsedMs }),
   );
+
+  // --- Phase 2: encode to output temp file ---
+  const outPath = join(tmpdir(), `aveeone-out-${randomUUID()}.mp4`);
+  const args = buildFfmpegArgs(inPath, outPath);
+  const encodeStart = Date.now();
+  console.log("aveeone.container.encode.start", JSON.stringify({ requestId, sourceUrl }));
 
   let ffmpeg;
   try {
     ffmpeg = spawn("ffmpeg", args, { stdio: ["ignore", "ignore", "pipe"] });
   } catch (err) {
+    await unlink(inPath).catch(() => {});
     await unlink(outPath).catch(() => {});
     return sendJsonError(res, 500, {
       error: "Failed to spawn ffmpeg",
@@ -136,7 +192,10 @@ async function handleTranscode(req, res) {
     });
   }
 
-  // Ring-ish buffer of the most recent stderr output, for error reporting.
+  // We no longer need the input file once ffmpeg has opened it. Unlink early
+  // so it's cleaned up even if the process is killed mid-encode.
+  unlink(inPath).catch(() => {});
+
   let stderrTail = "";
   ffmpeg.stderr.on("data", (chunk) => {
     stderrTail += chunk.toString();
@@ -145,13 +204,10 @@ async function handleTranscode(req, res) {
     }
   });
 
-  // Wait for ffmpeg to finish (resolve with exit code, or reject on spawn error).
   const exitCode = await new Promise((resolve, reject) => {
     ffmpeg.on("error", reject);
     ffmpeg.on("close", (code) => resolve(code));
-  }).catch((err) => {
-    return { spawnError: err };
-  });
+  }).catch((err) => ({ spawnError: err }));
 
   if (exitCode && typeof exitCode === "object" && exitCode.spawnError) {
     await unlink(outPath).catch(() => {});
@@ -177,10 +233,12 @@ async function handleTranscode(req, res) {
     });
   }
 
-  // Success: stream the finished file with a known Content-Length, then clean up.
-  let size;
+  const encodeElapsedMs = Date.now() - encodeStart;
+
+  // --- Phase 3: stat output, stream back to Worker ---
+  let outputSize;
   try {
-    ({ size } = await stat(outPath));
+    ({ size: outputSize } = await stat(outPath));
   } catch (err) {
     await unlink(outPath).catch(() => {});
     return sendJsonError(res, 500, {
@@ -192,30 +250,29 @@ async function handleTranscode(req, res) {
     });
   }
 
-  const ffmpegElapsedMs = Date.now() - spawnedAt;
   console.log(
-    "aveeone.container.done",
-    JSON.stringify({ requestId, sourceUrl, size, ffmpegElapsedMs }),
+    "aveeone.container.encode.done",
+    JSON.stringify({ requestId, sourceUrl, outputSize, encodeElapsedMs }),
   );
 
   res.writeHead(200, {
     "content-type": "video/mp4",
-    "content-length": String(size),
+    "content-length": String(outputSize),
     "x-request-id": String(requestId),
-    "x-ffmpeg-elapsed-ms": String(ffmpegElapsedMs),
-    "x-nproc": String(execSync("nproc", { encoding: "utf8" }).trim()),
+    // Timing headers read by the Worker to build the consolidated aveeone.timing log.
+    "x-container-start-ms":   containerStartMs !== null ? String(containerStartMs) : "",
+    "x-download-elapsed-ms":  String(downloadElapsedMs),
+    "x-encode-elapsed-ms":    String(encodeElapsedMs),
+    "x-input-size":           String(inputSize),
+    "x-nproc":                NPROC,
     "cache-control": "no-store",
   });
 
   const fileStream = createReadStream(outPath);
-  const cleanup = () => {
-    unlink(outPath).catch(() => {});
-  };
+  const cleanup = () => { unlink(outPath).catch(() => {}); };
   fileStream.on("error", (err) => {
-    console.error(
-      "aveeone.container.stream-error",
-      JSON.stringify({ requestId, details: String(err) }),
-    );
+    console.error("aveeone.container.stream-error",
+      JSON.stringify({ requestId, details: String(err) }));
     res.destroy(err);
     cleanup();
   });
@@ -227,7 +284,6 @@ async function handleTranscode(req, res) {
 const server = createServer((req, res) => {
   const url = new URL(req.url, "http://container");
 
-  // Health/readiness: any GET to "/" returns 200 so port checks succeed.
   if (url.pathname === "/" || url.pathname === "/health") {
     res.writeHead(200, { "content-type": "text/plain" });
     return res.end("ok");
@@ -235,8 +291,6 @@ const server = createServer((req, res) => {
 
   if (url.pathname === "/transcode") {
     handleTranscode(req, res).catch((err) => {
-      // Last-resort guard; handleTranscode handles its own errors, but never
-      // let a rejection go unhandled.
       sendJsonError(res, 500, {
         error: "Unhandled transcode error",
         stage: "container-unhandled",
