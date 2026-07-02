@@ -192,10 +192,6 @@ async function handleTranscode(req, res) {
     });
   }
 
-  // We no longer need the input file once ffmpeg has opened it. Unlink early
-  // so it's cleaned up even if the process is killed mid-encode.
-  unlink(inPath).catch(() => {});
-
   let stderrTail = "";
   ffmpeg.stderr.on("data", (chunk) => {
     stderrTail += chunk.toString();
@@ -208,6 +204,9 @@ async function handleTranscode(req, res) {
     ffmpeg.on("error", reject);
     ffmpeg.on("close", (code) => resolve(code));
   }).catch((err) => ({ spawnError: err }));
+
+  // Input file is no longer needed once ffmpeg has exited.
+  await unlink(inPath).catch(() => {});
 
   if (exitCode && typeof exitCode === "object" && exitCode.spawnError) {
     await unlink(outPath).catch(() => {});
