@@ -58,7 +58,7 @@ function buildFfmpegArgs(inPath, outPath) {
     "-preset",
     "6",
     "-crf",
-    "26",
+    "30",
     "-svtav1-params",
     "lp=4",
     // Audio: AAC
