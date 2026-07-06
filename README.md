@@ -199,7 +199,53 @@ relying on it:
 5. **No input verification.** We assume the source is a video ffmpeg can read.
    We don't probe container/codecs first.
 
+6. **A finished encode is not durable against a broken connection.** Cloudflare
+   places no hard duration limit on an HTTP-triggered Worker (CPU-time limits
+   don't count time spent awaiting `fetch()`, and container/DO calls have
+   unlimited wall time while the call is in flight), so long encodes are not a
+   Cloudflare *platform* timeout risk. The real risks are (a) intermediary/
+   client idle-response timeouts unrelated to Cloudflare — our response sends
+   zero bytes until the entire pipeline finishes, which is the worst case for
+   surviving a proxy or browser idle timeout — and (b) `ctx.waitUntil()`'s
+   documented **30-second** grace period, which only starts counting once a
+   disconnect is detected and would not be enough to finish a long in-progress
+   encode if triggered partway through. Separately, if the connection between
+   Worker and container (or the Worker's R2 upload) drops for any reason after
+   ffmpeg has already produced a file, that finished output is currently
+   **discarded, not salvaged** — the container has no way to persist a result
+   except by streaming it back over the same connection that requested it.
+   Closing this gap would mean having the container upload directly to R2
+   (independent of the Worker/client connection), which was considered and
+   deferred for this POC. See `AGENTS.md` for the full analysis.
+
 ## Version History and Observations:
+
+**v0.2.2:** Request duration / disconnect durability investigation (no code
+changes — documentation only)
+
+- Question: given preset/CRF changes have pushed encode times well past a
+  minute, at what point does the first (blocking) request risk timing out?
+- Findings (see `AGENTS.md` for full detail and sources):
+  - Cloudflare imposes no hard wall-clock duration limit on an HTTP-triggered
+    Worker, and none on a container/DO call while it's in flight, as long as
+    the requesting connection stays open. CPU-time limits (30s default / 300s
+    max) don't apply either, since `fetch()` await time isn't CPU time.
+  - The real ceiling is `ctx.waitUntil()`'s documented 30-second grace period
+    after a disconnect is detected — already relied on in `src/index.ts` as an
+    insurance policy, but only covers ~30s of remaining work, not a full
+    long-running encode if the client leaves early.
+  - `enable_request_signal` is not set, so disconnect-driven cancellation of
+    our own outbound `fetch()` calls is likely not happening automatically
+    today — this is undocumented default behavior, not a guarantee.
+  - Checked the container code directly: nothing listens for a dropped
+    connection during download/encode, so ffmpeg runs to completion regardless
+    (matches intuition) — but the finished file can only be delivered back over
+    the same connection that requested it, so a broken connection after a
+    successful encode currently **wastes** the work rather than salvaging it
+    into the cache.
+- Practical takeaway: no Cloudflare-imposed number to worry about, but
+  intermediary/client idle timeouts (unrelated to Cloudflare) are a real risk
+  now that cold-cache requests can run into the 100-300s+ range.
 
 **v0.2.1:** Performance investigation
 

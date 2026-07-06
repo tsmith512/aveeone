@@ -322,6 +322,77 @@ thereafter.
 
 ---
 
+## Request lifecycle and timeout behavior
+
+Relevant now that preset/CRF changes can push a cold-cache encode well past a
+minute. Verified against current Cloudflare docs (not assumed from memory):
+
+| Concern | Limit | Applies here? |
+|---|---|---|
+| Worker CPU time | 30s default / 300s max (`limits.cpu_ms`) | No — `fetch()` await time isn't CPU time; actual Worker CPU usage is trivial regardless of encode length |
+| Worker wall-clock (HTTP trigger) | **Unlimited** while the client stays connected | This is why 85–300s+ requests work at all |
+| Container/DO `fetch()` wall-clock | **Unlimited** while the Worker's call is in flight | Decoupled from the original client — the container only cares whether the Worker's own call to it is still open |
+| Container/DO CPU time | Same 30s/300s budget, reset per inbound request | No — `spawn("ffmpeg")` + awaiting its exit event isn't CPU time for the Node process; ffmpeg runs as a separate OS process |
+| `ctx.waitUntil()` | **Exactly 30 seconds**, counted from when the response is sent or the client disconnects | **Yes — the one real cliff**, see below |
+
+**Bottom line: no Cloudflare platform limit will kill a long encode as long as
+the requesting connection stays open.** The practical risks are elsewhere:
+
+1. **Intermediary/client idle-response timeouts, unrelated to Cloudflare.**
+   The current response sends zero bytes until the entire pipeline (download →
+   encode → upload → R2 read-back) completes — the worst case for surviving a
+   proxy, load balancer, or browser idle timeout (60–120s is a common default
+   for such intermediaries). This is a bigger practical risk than anything
+   Cloudflare enforces.
+
+2. **The `ctx.waitUntil()` 30-second grace, if a disconnect is ever detected.**
+   `src/index.ts` already uses this as an insurance policy:
+
+   ```ts
+   const task = generateAndStore(env, key, sourceStr, requestId);
+   ctx.waitUntil(task.then(() => undefined).catch(() => undefined));
+   const result = await task;
+   ```
+
+   Registering the *same* promise with `waitUntil` tells the runtime to give
+   it up to 30 more seconds if the invocation would otherwise end on
+   disconnect. That 30s is counted **from the disconnect**, not from job
+   start — a disconnect early in a 150s+ encode will not survive to
+   completion. Whether this cliff is actually reached in practice is itself
+   uncertain: Cloudflare's docs describe disconnect-driven cancellation with
+   soft language ("tasks... **may** be canceled"), and the documented, opt-in
+   mechanism for observing a disconnect (`request.signal`) requires the
+   `enable_request_signal` compatibility flag, which **this project does not
+   set**. No code here listens for a disconnect either. Practically, this
+   likely means disconnect cancellation mostly isn't happening today — good
+   for reliability, but it's relying on undocumented default behavior rather
+   than a guarantee, and could change.
+
+3. **A finished encode is not currently durable against a broken connection.**
+   Checked directly in `container_src/server.mjs`: there is no `req.on("close")`
+   (or similar) handling during the download or encode phases — only after
+   encoding, wired to the final output stream. This means:
+   - If the Worker↔container connection drops mid-download or mid-encode,
+     **nothing tells ffmpeg to stop.** It runs to completion regardless — this
+     matches the "container should finish its work" intuition.
+   - But the container's *only* way to deliver that result is streaming it
+     back over the same HTTP connection that requested it. If that connection
+     is gone by the time ffmpeg exits, `res.pipe()` errors, `fileStream`'s
+     error handler fires, and the finished output is **deleted** — the compute
+     succeeded but the result is thrown away, uncached, with no retry.
+   - The R2 multipart upload happens in the **Worker**, not the container. A
+     disconnect during that phase hits the `catch` block in
+     `generateAndStore()`, calls `multipart.abort()`, and nothing is cached.
+   - **Closing this gap requires the container to persist its result
+     independently of the Worker/client connection** — e.g. uploading directly
+     to R2 via the S3-compatible API (Mechanism A from the original R2-caching
+     design discussion, deferred at the time in favor of the simpler
+     Worker-mediated multipart upload used today). Revisit this if cold-cache
+     encode times continue to grow, or if dropped-connection waste becomes a
+     measured problem.
+
+---
+
 ## Known limitations and TODOs
 
 - **`@TODO` in `src/index.ts`:** HEAD preflight skips size check when origin
@@ -340,6 +411,9 @@ thereafter.
 - **`lp` is hardcoded.** If `instance_type` changes in `wrangler.jsonc`, the
   `lp=4` value in `buildFfmpegArgs` must be updated to match the new vCPU
   count.
+- **Encode results aren't durable against a dropped connection.** See
+  "Request lifecycle and timeout behavior" above. Fixing this means the
+  container uploading directly to R2 rather than streaming through the Worker.
 
 ---
 
