@@ -6,11 +6,15 @@ import { Container, getRandom } from "@cloudflare/containers";
  *
  * URL shape (mirrors Cloudflare Media Transformations):
  *
- *   https://<host>/<ARBITRARY_TEXT>/<SOURCE_URL>
+ *   https://<host>/<OPTIONS>/<SOURCE_URL>
  *
- * The first path segment (<ARBITRARY_TEXT>) would normally carry transform
- * options; this project ignores it. Everything after that first segment is
- * treated as the full source URL to fetch and transcode.
+ * The first path segment (<OPTIONS>) is used verbatim (unnormalized) as part
+ * of the R2 cache key, so it always at least acts as a manual cache buster.
+ * If it contains an "=" (i.e. it looks like real Media Transformations
+ * options, e.g. "width=640,height=360"), it is ALSO forwarded to Cloudflare
+ * Media Transformations first (`/cdn-cgi/media/<OPTIONS>/<SOURCE_URL>`), and
+ * the resulting edited variant — not the original source — is what gets fed
+ * into the AV1 transcoder. See `resolveEncodeUrl()` below.
  */
 
 export interface Env {
@@ -45,11 +49,17 @@ const MAX_SOURCE_BYTES = 1024 * 1024 * 1024; // 1 GiB
 
 /**
  * Derive the R2 object key for a request. The hash covers BOTH the options
- * segment (ARBITRARY_TEXT) and the source URL, so changing the options changes
- * the key — a cache bust today, and the cache identity for edit parameters once
- * ARBITRARY_TEXT is wired into ffmpeg. SHA-256 is virtually collision-free and
- * keeps keys fixed-length and opaque. The "\n" separator is unambiguous because
- * a path segment can't contain a newline.
+ * segment (OPTIONS) and the source URL, so changing the options changes
+ * the key — either a manual cache bust, or the cache identity for a distinct
+ * set of Media Transformations edit parameters. SHA-256 is virtually
+ * collision-free and keeps keys fixed-length and opaque. The "\n" separator is
+ * unambiguous because a path segment can't contain a newline.
+ *
+ * NOTE: `options` is hashed exactly as received — it is NOT normalized. Two
+ * requests with semantically-identical but differently-formatted options
+ * strings (e.g. differing key order, or `a=1,b=2` vs `b=2,a=1`) are treated
+ * as distinct cache entries and each trigger their own encode. See the
+ * "Known trade-offs & limitations" section of README.md.
  */
 async function outputKey(options: string, sourceUrl: string): Promise<string> {
   const digest = await crypto.subtle.digest(
@@ -60,6 +70,37 @@ async function outputKey(options: string, sourceUrl: string): Promise<string> {
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
   return `${OUTPUT_PREFIX}/av1-unedited/${hash}`;
+}
+
+/**
+ * Decide what URL the transcoder container should actually fetch and encode.
+ *
+ * - If `options` contains an "=" it's treated as real Media Transformations
+ *   parameters (e.g. "width=640,height=360"). The entire options string is
+ *   forwarded, as-is, to this Worker's own Media Transformations endpoint
+ *   (`/cdn-cgi/media/<options>/<sourceUrl>`) — a path Cloudflare intercepts at
+ *   the edge, ahead of Worker routing — and the resulting *edited* variant
+ *   becomes the input to the AV1 encode. In this mode, `options` doubles as
+ *   the cache buster (a different edit produces a different R2 key, per
+ *   `outputKey()`) AND drives an actual transform.
+ * - Otherwise, `options` is opaque and only participates in the cache key —
+ *   the original behaviour. The container encodes `sourceUrl` directly.
+ *
+ * `requestOrigin` is taken from the inbound request (not hardcoded) so this
+ * works under any host the Worker is served from (custom domain, preview
+ * URL, etc).
+ */
+function resolveEncodeUrl(
+  requestOrigin: string,
+  options: string,
+  sourceUrl: string,
+): { encodeUrl: string; isMediaTransform: boolean } {
+  const isMediaTransform = options.includes("=");
+  if (!isMediaTransform) {
+    return { encodeUrl: sourceUrl, isMediaTransform };
+  }
+  const encodeUrl = `${requestOrigin}/cdn-cgi/media/${options}/${sourceUrl}`;
+  return { encodeUrl, isMediaTransform };
 }
 
 /**
@@ -96,9 +137,10 @@ function failure(status: number, info: FailureInfo): Response {
  *
  *   /<options>/<source-url>
  *
- * - `options` is the first path segment (ARBITRARY_TEXT). Today it's opaque and
- *   only used as a cache key input (a cache bust); later it carries ffmpeg edit
- *   parameters.
+ * - `options` is the first path segment (OPTIONS), used verbatim as a cache
+ *   key input. If it contains an "=" it is also forwarded to Cloudflare Media
+ *   Transformations (see `resolveEncodeUrl()`); otherwise it's just a manual
+ *   cache buster, same as before.
  * - `sourceUrl` is everything after it, or null if absent (caller substitutes
  *   the default footage).
  *
@@ -210,11 +252,15 @@ async function serveFromR2(
 async function generateAndStore(
   env: Env,
   key: string,
-  sourceUrl: string,
+  encodeUrl: string,
   requestId: string,
+  originalSourceUrl: string,
 ): Promise<{ ok: true } | { ok: false; response: Response }> {
-  // Preflight: HEAD request to confirm the source is reachable and within the
-  // size limit before committing a container to the job. The Worker's network
+  // Preflight: HEAD request to confirm the encode input is reachable and
+  // within the size limit before committing a container to the job. This
+  // targets `encodeUrl` — for a Media Transformations request that's the
+  // `/cdn-cgi/media/...` edited-variant URL, not the original source — since
+  // that's what the container actually downloads. The Worker's network
   // reaches CF-hosted sources (R2, etc.) in ~130ms; this check is cheap.
   //
   // @TODO: some origins return 405 for HEAD or omit Content-Length. Currently
@@ -223,13 +269,13 @@ async function generateAndStore(
   // least confirm reachability when HEAD is not supported.
   const fetchStart = Date.now();
   try {
-    const preflight = await fetch(sourceUrl, { method: "HEAD" });
+    const preflight = await fetch(encodeUrl, { method: "HEAD" });
     const fetchElapsedMs = Date.now() - fetchStart;
 
     if (preflight.status === 405) {
       // Origin doesn't support HEAD — skip checks and let ffmpeg try directly.
       console.log("aveeone.preflight.skip", JSON.stringify({
-        requestId, sourceUrl, reason: "HEAD 405", fetchElapsedMs,
+        requestId, encodeUrl, originalSourceUrl, reason: "HEAD 405", fetchElapsedMs,
       }));
     } else if (!preflight.ok) {
       return {
@@ -238,7 +284,8 @@ async function generateAndStore(
           error: "Source URL returned a non-2xx status",
           stage: "preflight",
           requestId,
-          sourceUrl,
+          sourceUrl: originalSourceUrl,
+          encodeUrl,
           httpStatus: preflight.status,
         }),
       };
@@ -251,7 +298,8 @@ async function generateAndStore(
             error: "Source exceeds the maximum allowed input size",
             stage: "preflight",
             requestId,
-            sourceUrl,
+            sourceUrl: originalSourceUrl,
+            encodeUrl,
             contentLength,
             maxInputBytes: MAX_SOURCE_BYTES,
           }),
@@ -261,7 +309,7 @@ async function generateAndStore(
       // size cap cannot be enforced. Could use Range: bytes=0-0 to at least
       // confirm reachability and get the true size from Content-Range.
       console.log("aveeone.preflight.ok", JSON.stringify({
-        requestId, sourceUrl, contentLength: contentLength || null, fetchElapsedMs,
+        requestId, encodeUrl, originalSourceUrl, contentLength: contentLength || null, fetchElapsedMs,
       }));
     }
   } catch (err) {
@@ -271,22 +319,26 @@ async function generateAndStore(
         error: "Source preflight request failed",
         stage: "preflight",
         requestId,
-        sourceUrl,
+        sourceUrl: originalSourceUrl,
+        encodeUrl,
         details: err instanceof Error ? err.message : String(err),
       }),
     };
   }
 
-  // Dispatch the job to a pooled container instance. The container fetches the
-  // source URL directly with ffmpeg — the standard job-descriptor pattern for a
-  // transcoding service (URL in, encoded file out). ffmpeg's native HTTP client
-  // handles reconnects and HTTP-level seeking (e.g. moov-at-end recovery).
+  // Dispatch the job to a pooled container instance. The container fetches
+  // `encodeUrl` directly with ffmpeg — the standard job-descriptor pattern for
+  // a transcoding service (URL in, encoded file out). ffmpeg's native HTTP
+  // client handles reconnects and HTTP-level seeking (e.g. moov-at-end
+  // recovery). For a Media Transformations request, `encodeUrl` points at the
+  // `/cdn-cgi/media/...` edited variant, so the container never sees (or
+  // needs to know about) the original source URL.
   const dispatchedAt = Date.now();
   const container = await getRandom(env.TRANSCODER, POOL_SIZE);
   const containerRequest = new Request("http://container/transcode", {
     method: "GET",
     headers: {
-      "x-source-url": sourceUrl,
+      "x-source-url": encodeUrl,
       "x-request-id": requestId,
       // Used by the container to measure cold-start + routing latency.
       "x-dispatched-at": String(dispatchedAt),
@@ -310,7 +362,8 @@ async function generateAndStore(
         error: "Container returned a 200 with no body",
         stage: "generate",
         requestId,
-        sourceUrl,
+        sourceUrl: originalSourceUrl,
+        encodeUrl,
       }),
     };
   }
@@ -325,7 +378,7 @@ async function generateAndStore(
 
   const multipart = await env.OUTPUTS.createMultipartUpload(key, {
     httpMetadata: { contentType: "video/mp4" },
-    customMetadata: { sourceUrl, requestId },
+    customMetadata: { sourceUrl: originalSourceUrl, encodeUrl, requestId },
   });
 
   const parts: R2UploadedPart[] = [];
@@ -368,7 +421,8 @@ async function generateAndStore(
     // containerStartMs is null when x-dispatched-at was not echoed (old image).
     console.log("aveeone.timing", JSON.stringify({
       requestId,
-      sourceUrl,
+      sourceUrl: originalSourceUrl,
+      encodeUrl,          // what the container actually fetched (== sourceUrl unless Media Transformations was used)
       containerStartMs,   // cold-start + routing: ~0 when warm, ~2-3s on cold start
       downloadElapsedMs,  // source fetch inside the container
       encodeElapsedMs,    // ffmpeg wall-clock time
@@ -387,7 +441,8 @@ async function generateAndStore(
         error: "Failed while streaming the transcode into R2",
         stage: "generate-store",
         requestId,
-        sourceUrl,
+        sourceUrl: originalSourceUrl,
+        encodeUrl,
         details: err instanceof Error ? err.message : String(err),
       }),
     };
@@ -441,13 +496,22 @@ export default {
     const sourceStr = parsedSource.toString();
     const key = await outputKey(options, sourceStr);
 
+    // 3. If OPTIONS looks like real Media Transformations parameters (it
+    //    contains "="), resolve the URL the container should actually encode
+    //    to the `/cdn-cgi/media/...` edited variant. Otherwise OPTIONS is just
+    //    an opaque cache buster and the container encodes sourceStr directly.
+    //    Either way, the R2 key above is unaffected — it's always keyed on the
+    //    literal (options, sourceStr) pair.
+    const requestOrigin = new URL(request.url).origin;
+    const { encodeUrl, isMediaTransform } = resolveEncodeUrl(requestOrigin, options, sourceStr);
+
     console.log(
       "aveeone.request",
-      JSON.stringify({ requestId, options, sourceUrl: sourceStr, key }),
+      JSON.stringify({ requestId, options, sourceUrl: sourceStr, isMediaTransform, encodeUrl, key }),
     );
 
     try {
-      // 3. Cache hit? Serve straight from R2 (with Range support).
+      // 4. Cache hit? Serve straight from R2 (with Range support).
       const cached = await serveFromR2(env, key, request, requestId);
       if (cached) return cached;
 
@@ -459,10 +523,10 @@ export default {
         });
       }
 
-      // 4. Cache miss: transcode + persist to R2, then serve from R2.
+      // 5. Cache miss: transcode + persist to R2, then serve from R2.
       //    waitUntil keeps the upload alive even if the client disconnects
       //    mid-encode, so the object still lands for the next request.
-      const task = generateAndStore(env, key, sourceStr, requestId);
+      const task = generateAndStore(env, key, encodeUrl, requestId, sourceStr);
       ctx.waitUntil(task.then(() => undefined).catch(() => undefined));
 
       const result = await task;

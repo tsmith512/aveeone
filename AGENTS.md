@@ -15,15 +15,26 @@ convention of [Cloudflare Media Transformations]:
 https://aveeone.tsmith.net/<OPTIONS>/<SOURCE_URL>
 ```
 
-- `<OPTIONS>` — first path segment. Currently opaque; it is part of the R2
-  cache key (so changing it busts the cache). Future: ffmpeg edit parameters.
+- `<OPTIONS>` — first path segment. Always used **verbatim, unnormalized** as
+  part of the R2 cache key (so any change busts the cache). If it contains an
+  `=` (e.g. `width=640,height=360`), it's treated as real
+  [Media Transformations](https://developers.cloudflare.com/stream/transform-videos/)
+  parameters: on a cache miss, the Worker forwards the whole string to its own
+  `/cdn-cgi/media/<OPTIONS>/<SOURCE_URL>` endpoint first, and encodes the
+  *edited* result rather than `<SOURCE_URL>` directly. If it has no `=`, it's
+  just an opaque cache buster and no Media Transformations request happens —
+  the original (pre-v0.3.0) behavior. See `resolveEncodeUrl()` in
+  `src/index.ts`.
 - `<SOURCE_URL>` — full `https://` URL to the source MP4. If absent, the
   default test footage (`assets.tsmith.net/aus-mobile.mp4`) is used.
 
 Responses are served from an R2 cache keyed by
-`sha256(options + "\n" + sourceUrl)`. Only the first request per
-(options, source) pair triggers a container encode; all subsequent requests —
-including browser seek/range requests — are served from R2.
+`sha256(options + "\n" + sourceUrl)` — this key is always based on the
+*original* `sourceUrl`, never the resolved `/cdn-cgi/media/...` URL, and is
+unaffected by whether a Media Transformations request happens. Only the first
+request per (options, source) pair triggers a container encode; all
+subsequent requests — including browser seek/range requests — are served from
+R2.
 
 ---
 
@@ -398,10 +409,16 @@ the requesting connection stays open.** The practical risks are elsewhere:
 - **`@TODO` in `src/index.ts`:** HEAD preflight skips size check when origin
   returns `405` or omits `Content-Length`. Future: `Range: bytes=0-0` GET
   fallback.
-- **`OPTIONS` not yet parsed.** The first path segment is hashed into the cache
-  key but not interpreted. Future: parse it into ffmpeg parameters (trim, scale,
-  CRF, etc.). When this changes, bump `OUTPUT_PREFIX` and update the `av1-unedited`
-  path segment to reflect the new semantics.
+- **`OPTIONS` is only interpreted as Media Transformations parameters, not
+  arbitrary ffmpeg flags.** As of v0.3.0, `OPTIONS` containing `=` is forwarded
+  to `/cdn-cgi/media/<OPTIONS>/<SOURCE_URL>` (Cloudflare's own transform
+  syntax — resize, crop, trim, etc. per the Media Transformations docs), not
+  parsed by this Worker itself. Direct ffmpeg-level options (e.g. custom CRF
+  per request) are still unimplemented.
+- **`OPTIONS` is not normalized for the cache key.** It's hashed exactly as
+  received; two differently-formatted-but-equivalent options strings (key
+  order, whitespace, casing) are distinct cache entries and each trigger their
+  own Media Transformations request + encode. See README.md.
 - **No single-flight coordination.** Concurrent misses for the same
   (options, source) pair each trigger a full encode (last write to R2 wins).
   Future: a Durable Object lock keyed by the R2 key.

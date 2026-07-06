@@ -10,13 +10,20 @@ The URL scheme mirrors
 [Cloudflare Media Transformations](https://developers.cloudflare.com/stream/transform-videos/#transform-a-video-by-url):
 
 ```
-https://<host>/<ARBITRARY_TEXT>/<SOURCE_URL>
+https://<host>/<OPTIONS>/<SOURCE_URL>
 ```
 
-- `<ARBITRARY_TEXT>` is where transform options will eventually go. It's not
-  yet interpreted, but it **is part of the cache key** — changing it forces a
-  fresh transcode (a manual cache bust today; the basis for edit parameters
-  later).
+- `<OPTIONS>` is the first path segment. It's always used **verbatim, as-is**
+  (no normalization) as part of the R2 cache key — a different string always
+  forces a fresh transcode.
+  - If it contains an **`=`** (e.g. `width=640,height=360`), it's treated as
+    real [Media Transformations](https://developers.cloudflare.com/stream/transform-videos/)
+    options: the *entire* `<OPTIONS>` string is forwarded, unmodified, to this
+    Worker's own `/cdn-cgi/media/<OPTIONS>/<SOURCE_URL>` endpoint first, and
+    the **edited variant** that comes back — not the original source — is what
+    gets fed into the AV1 transcoder.
+  - If it doesn't contain `=`, it's just an opaque cache buster, same as
+    before — no Media Transformations request is made.
 - `<SOURCE_URL>` is the full `http(s)` URL of the source MP4. If omitted, a
   default test clip (`https://assets.tsmith.net/aus-mobile.mp4`) is used.
 
@@ -25,7 +32,11 @@ Deployed at **https://aveeone.tsmith.net** (custom domain).
 ### Example
 
 ```
+# Plain cache buster, no Media Transformations edit:
 https://aveeone.tsmith.net/transform/https://example.com/video.mp4
+
+# Media Transformations edit (resized + trimmed) applied before AV1 encode:
+https://aveeone.tsmith.net/width=640,height=360/https://example.com/video.mp4
 
 # No source URL -> transcodes the default test footage:
 https://aveeone.tsmith.net/
@@ -35,18 +46,27 @@ https://aveeone.tsmith.net/
 
 ```
 client ──▶ Worker (src/index.ts)
-                │  parse + validate source URL from the path
+                │  parse + validate options + source URL from the path
                 │  key = OUTPUT_PREFIX/av1-unedited/sha256(options + sourceUrl)
                 ▼
            R2 "OUTPUTS"  ──hit──▶  serve object (Content-Length, Range/206)
                 │
                miss (GET)
                 ▼
+           options contains "="?
+                │                                    │
+               yes                                   no
+                ▼                                    │
+           encodeUrl = /cdn-cgi/media/<options>/<sourceUrl>   │
+           (Media Transformations edited variant)             │
+                │                                    │
+                └───────────────────┬────────────────┘
+                                     ▼  encodeUrl (edited or original)
            Container DO "Transcoder"  (one ffmpeg per instance)
-                │  container_src/server.mjs receives X-Source-Url
-                │  curl preflight: reachable? size <= 1 GiB?  (else 500)
+                │  container_src/server.mjs receives X-Source-Url = encodeUrl
+                │  Worker preflight: reachable? size <= 1 GiB?  (else 500)
                 ▼
-           ffmpeg -i <SOURCE_URL>
+           ffmpeg -i <encodeUrl>
                    -c:v libsvtav1 -preset 6 -crf 26
                    -c:a aac
                    -dn -map_chapters -1
@@ -60,10 +80,18 @@ client ──▶ Worker (src/index.ts)
 
 - **Outputs are cached in R2.** The Worker keys each result by
   `sha256(options + sourceUrl)` under `OUTPUT_PREFIX/av1-unedited/`, so the
-  `<ARBITRARY_TEXT>` segment participates in the cache identity. Repeat requests
+  `<OPTIONS>` segment participates in the cache identity. Repeat requests
   (including browser **Range**/seek requests) are served straight from R2 with
   `Content-Length`, `Accept-Ranges`, and `206 Partial Content` — no container,
   no re-encode.
+- **Media Transformations edits happen before the AV1 encode.** If `<OPTIONS>`
+  contains an `=`, the Worker first requests
+  `https://<host>/cdn-cgi/media/<OPTIONS>/<SOURCE_URL>` — a path Cloudflare
+  intercepts at the edge — and hands the *edited* result to the container as
+  its encode input, instead of `<SOURCE_URL>` directly. The container is
+  unaware this happened; it just fetches whatever URL it's given (the
+  job-descriptor pattern still holds). If `<OPTIONS>` has no `=`, this step is
+  skipped entirely and the container encodes `<SOURCE_URL>` as before.
 - **First request blocks.** On a miss the first caller waits for the full
   encode, then is served from R2, so even the first response is seekable. The
   R2 upload runs under `ctx.waitUntil`, so the object still lands even if that
@@ -127,10 +155,15 @@ you expected a container change to take effect, this is why.
 ### Try it
 
 ```bash
-# Transcode a specific source:
+# Transcode a specific source (options has no "=", so it's just a cache buster):
 curl -L \
   "https://aveeone.tsmith.net/x/https://example.com/video.mp4" \
   -o out.mp4
+
+# Apply a Media Transformations edit (resize) before the AV1 encode:
+curl -L \
+  "https://aveeone.tsmith.net/width=640,height=360/https://example.com/video.mp4" \
+  -o out-640x360.mp4
 
 # Or just hit the root to transcode the default test footage:
 curl -L "https://aveeone.tsmith.net/" -o out.mp4
@@ -199,7 +232,16 @@ relying on it:
 5. **No input verification.** We assume the source is a video ffmpeg can read.
    We don't probe container/codecs first.
 
-6. **A finished encode is not durable against a broken connection.** Cloudflare
+6. **`OPTIONS` is not normalized for the cache key.** The Worker hashes the
+   `<OPTIONS>` path segment exactly as received — no key sorting, no
+   canonicalization. Two requests with semantically-identical but
+   differently-formatted options (e.g. `width=640,height=360` vs
+   `height=360,width=640`, or extra whitespace/casing differences) hash to
+   different R2 keys and each trigger their own Media Transformations request
+   + AV1 encode, even though they'd produce the same edited video. Callers
+   should format `<OPTIONS>` consistently to get cache reuse.
+
+7. **A finished encode is not durable against a broken connection.** Cloudflare
    places no hard duration limit on an HTTP-triggered Worker (CPU-time limits
    don't count time spent awaiting `fetch()`, and container/DO calls have
    unlimited wall time while the call is in flight), so long encodes are not a
@@ -219,6 +261,20 @@ relying on it:
    deferred for this POC. See `AGENTS.md` for the full analysis.
 
 ## Version History and Observations:
+
+**v0.3.0:** Wired up Cloudflare Media Transformations
+
+- Renamed the first path segment from `ARBITRARY_TEXT` to `OPTIONS` throughout
+  the code and docs.
+- On a cache miss, if `OPTIONS` contains an `=`, the Worker now first requests
+  `https://<host>/cdn-cgi/media/<OPTIONS>/<SOURCE_URL>` and feeds the resulting
+  edited variant into the AV1 transcoder, instead of `<SOURCE_URL>` directly.
+  If `OPTIONS` has no `=`, behavior is unchanged (opaque cache buster only).
+- The R2 cache key is still `sha256(OPTIONS + "\n" + SOURCE_URL)` — unaffected
+  by whether a Media Transformations request happens — so `OPTIONS` continues
+  to double as the cache identity in both modes.
+- `OPTIONS` is still hashed verbatim, with no normalization; see "Known
+  trade-offs & limitations" above.
 
 **v0.2.2:** Request duration / disconnect durability investigation (no code
 changes — documentation only)
