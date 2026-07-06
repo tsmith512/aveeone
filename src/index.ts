@@ -255,68 +255,113 @@ async function generateAndStore(
   encodeUrl: string,
   requestId: string,
   originalSourceUrl: string,
+  isMediaTransform: boolean,
 ): Promise<{ ok: true } | { ok: false; response: Response }> {
-  // Preflight: HEAD request to confirm the encode input is reachable and
-  // within the size limit before committing a container to the job. This
+  // Preflight: confirm the encode input is reachable (and, where possible,
+  // within the size limit) before committing a container to the job. This
   // targets `encodeUrl` — for a Media Transformations request that's the
   // `/cdn-cgi/media/...` edited-variant URL, not the original source — since
-  // that's what the container actually downloads. The Worker's network
-  // reaches CF-hosted sources (R2, etc.) in ~130ms; this check is cheap.
+  // that's what the container actually downloads.
   //
-  // @TODO: some origins return 405 for HEAD or omit Content-Length. Currently
-  // we skip the checks that can't be satisfied and proceed to transcode. A
-  // future improvement could try a Range: bytes=0-0 GET as a fallback to at
-  // least confirm reachability when HEAD is not supported.
+  // The two cases need different strategies:
+  //
+  // - Plain source (`isMediaTransform` false): a cheap HEAD, as before.
+  // - Media Transformations (`isMediaTransform` true): `/cdn-cgi/media/...`
+  //   does not support HEAD or Range — Cloudflare intercepts it as an edge
+  //   transform, not a static file server, so a HEAD here would always look
+  //   like a failure even on success. Media Transformations already validates
+  //   the source and edit parameters itself (reachability, size, etc.), so we
+  //   do a real GET and trust its response: a video/* response means the edit
+  //   succeeded and is safe to hand to the container. Anything else — a
+  //   non-2xx status, or a non-video content-type on a 200 — is surfaced
+  //   directly as a preflight error, since Media Transformations' own status/
+  //   body IS the real error (bad params, unreachable/oversized source, etc).
+  //   We never read the body on success; the container fetches its own copy,
+  //   so we cancel the stream to avoid buffering the whole video here.
   const fetchStart = Date.now();
   try {
-    const preflight = await fetch(encodeUrl, { method: "HEAD" });
-    const fetchElapsedMs = Date.now() - fetchStart;
+    if (isMediaTransform) {
+      const preflight = await fetch(encodeUrl, { method: "GET" });
+      const fetchElapsedMs = Date.now() - fetchStart;
+      const contentType = preflight.headers.get("content-type") ?? "";
 
-    if (preflight.status === 405) {
-      // Origin doesn't support HEAD — skip checks and let ffmpeg try directly.
-      console.log("aveeone.preflight.skip", JSON.stringify({
-        requestId, encodeUrl, originalSourceUrl, reason: "HEAD 405", fetchElapsedMs,
-      }));
-    } else if (!preflight.ok) {
-      return {
-        ok: false,
-        response: failure(500, {
-          error: "Source URL returned a non-2xx status",
-          stage: "preflight",
-          requestId,
-          sourceUrl: originalSourceUrl,
-          encodeUrl,
-          httpStatus: preflight.status,
-        }),
-      };
-    } else {
-      const contentLength = Number(preflight.headers.get("content-length") ?? 0);
-      if (contentLength > 0 && contentLength > MAX_SOURCE_BYTES) {
+      if (!preflight.ok || !contentType.startsWith("video/")) {
+        const bodyText = await preflight.text().catch(() => "");
         return {
           ok: false,
           response: failure(500, {
-            error: "Source exceeds the maximum allowed input size",
+            error: "Media Transformations request failed",
             stage: "preflight",
             requestId,
             sourceUrl: originalSourceUrl,
             encodeUrl,
-            contentLength,
-            maxInputBytes: MAX_SOURCE_BYTES,
+            httpStatus: preflight.status,
+            contentType: contentType || null,
+            details: bodyText.slice(0, 4000) || undefined,
           }),
         };
       }
-      // @TODO: if contentLength === 0 the origin didn't send Content-Length;
-      // size cap cannot be enforced. Could use Range: bytes=0-0 to at least
-      // confirm reachability and get the true size from Content-Range.
+
+      await preflight.body?.cancel().catch(() => {});
       console.log("aveeone.preflight.ok", JSON.stringify({
-        requestId, encodeUrl, originalSourceUrl, contentLength: contentLength || null, fetchElapsedMs,
+        requestId, encodeUrl, originalSourceUrl, mediaTransform: true, contentType, fetchElapsedMs,
       }));
+    } else {
+      // @TODO: some origins return 405 for HEAD or omit Content-Length. Currently
+      // we skip the checks that can't be satisfied and proceed to transcode. A
+      // future improvement could try a Range: bytes=0-0 GET as a fallback to at
+      // least confirm reachability when HEAD is not supported.
+      const preflight = await fetch(encodeUrl, { method: "HEAD" });
+      const fetchElapsedMs = Date.now() - fetchStart;
+
+      if (preflight.status === 405) {
+        // Origin doesn't support HEAD — skip checks and let ffmpeg try directly.
+        console.log("aveeone.preflight.skip", JSON.stringify({
+          requestId, encodeUrl, originalSourceUrl, reason: "HEAD 405", fetchElapsedMs,
+        }));
+      } else if (!preflight.ok) {
+        return {
+          ok: false,
+          response: failure(500, {
+            error: "Source URL returned a non-2xx status",
+            stage: "preflight",
+            requestId,
+            sourceUrl: originalSourceUrl,
+            encodeUrl,
+            httpStatus: preflight.status,
+          }),
+        };
+      } else {
+        const contentLength = Number(preflight.headers.get("content-length") ?? 0);
+        if (contentLength > 0 && contentLength > MAX_SOURCE_BYTES) {
+          return {
+            ok: false,
+            response: failure(500, {
+              error: "Source exceeds the maximum allowed input size",
+              stage: "preflight",
+              requestId,
+              sourceUrl: originalSourceUrl,
+              encodeUrl,
+              contentLength,
+              maxInputBytes: MAX_SOURCE_BYTES,
+            }),
+          };
+        }
+        // @TODO: if contentLength === 0 the origin didn't send Content-Length;
+        // size cap cannot be enforced. Could use Range: bytes=0-0 to at least
+        // confirm reachability and get the true size from Content-Range.
+        console.log("aveeone.preflight.ok", JSON.stringify({
+          requestId, encodeUrl, originalSourceUrl, contentLength: contentLength || null, fetchElapsedMs,
+        }));
+      }
     }
   } catch (err) {
     return {
       ok: false,
       response: failure(500, {
-        error: "Source preflight request failed",
+        error: isMediaTransform
+          ? "Media Transformations preflight request failed"
+          : "Source preflight request failed",
         stage: "preflight",
         requestId,
         sourceUrl: originalSourceUrl,
@@ -526,7 +571,7 @@ export default {
       // 5. Cache miss: transcode + persist to R2, then serve from R2.
       //    waitUntil keeps the upload alive even if the client disconnects
       //    mid-encode, so the object still lands for the next request.
-      const task = generateAndStore(env, key, encodeUrl, requestId, sourceStr);
+      const task = generateAndStore(env, key, encodeUrl, requestId, sourceStr, isMediaTransform);
       ctx.waitUntil(task.then(() => undefined).catch(() => undefined));
 
       const result = await task;

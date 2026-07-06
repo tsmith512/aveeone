@@ -64,7 +64,9 @@ client ──▶ Worker (src/index.ts)
                                      ▼  encodeUrl (edited or original)
            Container DO "Transcoder"  (one ffmpeg per instance)
                 │  container_src/server.mjs receives X-Source-Url = encodeUrl
-                │  Worker preflight: reachable? size <= 1 GiB?  (else 500)
+                │  Worker preflight (else 500):
+                │    plain source        → HEAD, reachable? size <= 1 GiB?
+                │    Media Transforms.   → GET, video/* response? (trust CF's own checks)
                 ▼
            ffmpeg -i <encodeUrl>
                    -c:v libsvtav1 -preset 6 -crf 26
@@ -92,6 +94,13 @@ client ──▶ Worker (src/index.ts)
   unaware this happened; it just fetches whatever URL it's given (the
   job-descriptor pattern still holds). If `<OPTIONS>` has no `=`, this step is
   skipped entirely and the container encodes `<SOURCE_URL>` as before.
+- **Media Transformations preflight is a real `GET`, not a `HEAD`.**
+  `/cdn-cgi/media/...` doesn't support `HEAD` or `Range` — Cloudflare treats it
+  as an edge transform, not a static file. Since Media Transformations already
+  validates the source and edit parameters itself, the Worker trusts a
+  `video/*` response as success (without reading the body — the container
+  fetches its own copy) and passes through any non-2xx status or non-video
+  response as the preflight error, verbatim.
 - **First request blocks.** On a miss the first caller waits for the full
   encode, then is served from R2, so even the first response is seekable. The
   R2 upload runs under `ctx.waitUntil`, so the object still lands even if that
@@ -100,9 +109,15 @@ client ──▶ Worker (src/index.ts)
   responds `200` (with `Content-Length`) on `ffmpeg` exit `0`; any failure is a
   non-200, so a partial object is never stored. The Worker `abort()`s the
   multipart upload on any stream error.
-- Before encoding, the container runs a **`curl` preflight** (`HEAD`, following
-  redirects) to confirm the source is reachable and reject inputs whose
-  `Content-Length` exceeds **1 GiB** — both return a `500` JSON with context.
+- Before dispatching to the container, the Worker preflights `encodeUrl`. For a
+  plain source this is a `HEAD` request that rejects inputs whose
+  `Content-Length` exceeds **1 GiB**. For a Media Transformations request
+  (`encodeUrl` is `/cdn-cgi/media/...`), `HEAD`/`Range` aren't supported there,
+  so the Worker does a real `GET` instead and trusts Media Transformations'
+  own validation: a `video/*` response means the edit succeeded; anything else
+  — including its own size/reachability errors — is surfaced directly as a
+  `500` JSON `preflight` failure. Either way, a failed preflight returns `500`
+  JSON with context before any container is spun up.
 - `-dn -map_chapters -1` keeps output to video + audio only (the source's
   chapter markers would otherwise be muxed in as a stray `bin_data` text track).
 - Output is a standard **faststart MP4** (`moov` atom at the front) for clean

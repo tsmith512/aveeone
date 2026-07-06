@@ -62,7 +62,9 @@ Worker (src/index.ts)
   ├─ outputKey()                → sha256(options + "\n" + sourceUrl)
   ├─ serveFromR2()              → 200/206 on cache hit (Range supported)
   └─ generateAndStore()         → on cache miss:
-       ├─ HEAD preflight        → confirm reachable, check ≤1GiB
+       ├─ preflight(encodeUrl)  → plain source: HEAD, confirm reachable, ≤1GiB
+       │                          Media Transform: GET, trust video/* response
+       │                          (cdn-cgi/media doesn't support HEAD/Range)
        ├─ container.fetch()     → GET /transcode + x-source-url header
        │                          (dispatches to pooled Transcoder DO)
        ├─ R2 multipart upload   → streams container response into R2
@@ -221,8 +223,8 @@ was warm; 2–4 s indicates a cold start.
 | Event | Where | Purpose |
 |---|---|---|
 | `aveeone.request` | Worker | Every inbound request: requestId, options, sourceUrl, key |
-| `aveeone.preflight.ok` | Worker | HEAD succeeded: contentLength, fetchElapsedMs |
-| `aveeone.preflight.skip` | Worker | Origin returned 405 for HEAD; proceeding anyway |
+| `aveeone.preflight.ok` | Worker | Preflight succeeded: plain source (HEAD) logs contentLength; Media Transformations (GET) logs contentType |
+| `aveeone.preflight.skip` | Worker | Plain source origin returned 405 for HEAD; proceeding anyway |
 | `aveeone.failure` | Worker | Any 500 response: full error context |
 | `aveeone.container.startup` | Container | nproc at container start |
 | `aveeone.container.download` | Container | Phase 1 done: inputSize, downloadElapsedMs |
