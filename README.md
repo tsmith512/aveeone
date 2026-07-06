@@ -2,7 +2,7 @@
 
 > Pronounced like **AV1**, the codec.
 
-A Cloudflare Worker that takes a URL to an MP4 video and transcodes it to
+A Cloudflare Worker that accepts a URL to an MP4 video and transcodes it to
 **AV1 / AAC** on the fly using a Workers Container running `ffmpeg`
 (`libsvtav1`). The result is streamed back as an MP4 HTTP response.
 
@@ -15,15 +15,14 @@ https://<host>/<OPTIONS>/<SOURCE_URL>
 
 - `<OPTIONS>` is the first path segment. It's always used **verbatim, as-is**
   (no normalization) as part of the R2 cache key — a different string always
-  forces a fresh transcode.
+  forces a fresh transcode:
   - If it contains an **`=`** (e.g. `width=640,height=360`), it's treated as
     real [Media Transformations](https://developers.cloudflare.com/stream/transform-videos/)
-    options: the *entire* `<OPTIONS>` string is forwarded, unmodified, to this
-    Worker's own `/cdn-cgi/media/<OPTIONS>/<SOURCE_URL>` endpoint first, and
+    options string: the *entire* `<OPTIONS>` string is forwarded, unmodified, to
+    this Worker's own `/cdn-cgi/media/<OPTIONS>/<SOURCE_URL>` endpoint first, and
     the **edited variant** that comes back — not the original source — is what
     gets fed into the AV1 transcoder.
-  - If it doesn't contain `=`, it's just an opaque cache buster, same as
-    before — no Media Transformations request is made.
+  - If it _does not_ contain `=`, it's just an opaque cache buster.
 - `<SOURCE_URL>` is the full `http(s)` URL of the source MP4. If omitted, a
   default test clip (`https://assets.tsmith.net/aus-mobile.mp4`) is used.
 
@@ -33,7 +32,7 @@ Deployed at **https://aveeone.tsmith.net** (custom domain).
 
 ```
 # Plain cache buster, no Media Transformations edit:
-https://aveeone.tsmith.net/transform/https://example.com/video.mp4
+https://aveeone.tsmith.net/x/https://example.com/video.mp4
 
 # Media Transformations edit (resized + trimmed) applied before AV1 encode:
 https://aveeone.tsmith.net/width=640,height=360/https://example.com/video.mp4
@@ -54,13 +53,13 @@ client ──▶ Worker (src/index.ts)
                miss (GET)
                 ▼
            options contains "="?
-                │                                    │
-               yes                                   no
-                ▼                                    │
+                │                                             │
+               yes                                            no
+                ▼                                             │
            encodeUrl = /cdn-cgi/media/<options>/<sourceUrl>   │
            (Media Transformations edited variant)             │
-                │                                    │
-                └───────────────────┬────────────────┘
+                │                                             │
+                └────────────────────┬────────────────────────┘
                                      ▼  encodeUrl (edited or original)
            Container DO "Transcoder"  (one ffmpeg per instance)
                 │  container_src/server.mjs receives X-Source-Url = encodeUrl
@@ -76,16 +75,15 @@ client ──▶ Worker (src/index.ts)
                    -f mp4 /tmp/<id>.mp4        (encode to disk)
                 │  responds 200 + Content-Length ONLY on ffmpeg exit 0
                 ▼
-           Worker streams it into R2 via multipart upload (~8 MiB parts),
+           Worker uploads it into R2 via multipart upload (~8 MiB parts),
            then serves the first client from R2 (full Range support).
 ```
 
 - **Outputs are cached in R2.** The Worker keys each result by
-  `sha256(options + sourceUrl)` under `OUTPUT_PREFIX/av1-unedited/`, so the
-  `<OPTIONS>` segment participates in the cache identity. Repeat requests
+  `sha256(options + sourceUrl)` under a hardcoded namespace, so the
+  `<OPTIONS>` segment is included in the cache key. Thus: repeat requests
   (including browser **Range**/seek requests) are served straight from R2 with
-  `Content-Length`, `Accept-Ranges`, and `206 Partial Content` — no container,
-  no re-encode.
+  `Content-Length`, `Accept-Ranges`, and `206 Partial Content` — no re-encode.
 - **Media Transformations edits happen before the AV1 encode.** If `<OPTIONS>`
   contains an `=`, the Worker first requests
   `https://<host>/cdn-cgi/media/<OPTIONS>/<SOURCE_URL>` — a path Cloudflare
@@ -118,8 +116,6 @@ client ──▶ Worker (src/index.ts)
   — including its own size/reachability errors — is surfaced directly as a
   `500` JSON `preflight` failure. Either way, a failed preflight returns `500`
   JSON with context before any container is spun up.
-- `-dn -map_chapters -1` keeps output to video + audio only (the source's
-  chapter markers would otherwise be muxed in as a stray `bin_data` text track).
 - Output is a standard **faststart MP4** (`moov` atom at the front) for clean
   in-browser seeking — possible because the container writes to a seekable file
   rather than a pipe.
@@ -229,17 +225,17 @@ relying on it:
    encode before any bytes arrive. Subsequent requests are served instantly from
    R2. There's no queue/async job model — the first request blocks.
 
-2. **No single-flight.** Two simultaneous misses for the same source trigger two
-   encodes (last write into R2 wins). Fine for a single-user POC; a production
+2. **No request coalescing.** Two simultaneous misses for the same source trigger
+   two encodes (last write into R2 wins). Fine for a single-user POC; a production
    build would coordinate with a lock (e.g. a Durable Object) so concurrent
    misses share one encode.
 
 3. **Cache is never invalidated.** Objects are immutable per
    `OUTPUT_PREFIX`/`sha256(url)` and served with a 1-year `immutable`
-   `Cache-Control`. Changing encode behaviour requires bumping `OUTPUT_PREFIX`;
+   `Cache-Control`. Changing encode behavior requires bumping `OUTPUT_PREFIX`;
    stale objects under old prefixes are not cleaned up automatically.
 
-4. **Open transcoder / SSRF.** The Worker will fetch any `http(s)` URL it's
+4. **No origin restrictions.** The Worker will fetch any `http(s)` URL it's
    given. There's no allowlist, auth, or rate limiting. Add those before
    exposing this publicly. (The 1 GiB preflight cap only limits size, not
    destination.)
@@ -277,19 +273,29 @@ relying on it:
 
 ## Version History and Observations:
 
-**v0.3.0:** Wired up Cloudflare Media Transformations
+**v0.3.0:** Route requests via Cloudflare Media Transformations first.
 
-- Renamed the first path segment from `ARBITRARY_TEXT` to `OPTIONS` throughout
-  the code and docs.
-- On a cache miss, if `OPTIONS` contains an `=`, the Worker now first requests
-  `https://<host>/cdn-cgi/media/<OPTIONS>/<SOURCE_URL>` and feeds the resulting
-  edited variant into the AV1 transcoder, instead of `<SOURCE_URL>` directly.
-  If `OPTIONS` has no `=`, behavior is unchanged (opaque cache buster only).
-- The R2 cache key is still `sha256(OPTIONS + "\n" + SOURCE_URL)` — unaffected
-  by whether a Media Transformations request happens — so `OPTIONS` continues
-  to double as the cache identity in both modes.
-- `OPTIONS` is still hashed verbatim, with no normalization; see "Known
-  trade-offs & limitations" above.
+- Goal: Be able to serve transformation operations without rebuilding the entire
+  product in this prototype.
+- Worker changes:
+  - On a cache miss, if `OPTIONS` contains an `=`, the Worker now first requests
+    `https://<host>/cdn-cgi/media/<OPTIONS>/<SOURCE_URL>` and feeds the resulting
+    edited variant into the AV1 transcoder. Otherwise, it's just a cache buster.
+- Container changes:
+  - Nothing in this version
+- Findings:
+  - Fetching an AV1 of the resized (`width=640`) sample asset finished in 21
+    seconds. Repeating that fetch returned in 0.35s.
+    - Media Transformations H.264: 2.47MB
+    - Aveeone AV1: 2.42MB
+  - At a larger size (`height=720`):
+    - Media Transformations H.264: 7.16MB returned in 5.8 seconds.
+    - Aveeone AV1: 7.50MVB returned in 52 seconds.
+  - At `height=1080` (which is the original size of the asset):
+    - Original:
+    - Media Transformations H.264: 13.8MB in 1.09s
+    - Aveeone AV1 based on MT result: 14.19MB in 88.9s
+    - Aveeone AV1 based on original: 16.88MB in 109.6s
 
 **v0.2.2:** Request duration / disconnect durability investigation (no code
 changes — documentation only)

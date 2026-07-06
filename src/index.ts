@@ -37,9 +37,10 @@ const POOL_SIZE = 2;
 /**
  * R2 key namespace for cached outputs by project generation.
  *
- * gen1 - produces UNEDITED assets only, only in AC1/AAC
+ * gen1 - produces UNEDITED assets only, only in AV1/AAC
+ * gen2 - transcodes CF Media Transformations results to AV1/AAC
  */
-const OUTPUT_PREFIX = "gen1";
+const OUTPUT_PREFIX = "gen2";
 
 /** Multipart part size while streaming the encode into R2 (>= 5 MiB required). */
 const R2_PART_SIZE = 8 * 1024 * 1024;
@@ -69,7 +70,7 @@ async function outputKey(options: string, sourceUrl: string): Promise<string> {
   const hash = [...new Uint8Array(digest)]
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
-  return `${OUTPUT_PREFIX}/av1-unedited/${hash}`;
+  return `${OUTPUT_PREFIX}/av1/${hash}`;
 }
 
 /**
