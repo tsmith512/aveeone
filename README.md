@@ -301,15 +301,16 @@ sampling for both logs and traces (`wrangler.jsonc`).
     - Media Transformations H.264: 7.16MB in 7.7s
     - Aveeone AV1: 7.28MB in 56.2s
   - Sample at `height=1080` (original height):
-    - Media Transformations H.264: 13.87MB in 8.5s
-    - Aveeone AV1 (based on MT): 13.93MB 109.4s
-    - Aveeone AV1 (based on raw input): 16.65MB in 83s
+    - Media Transformations H.264: 13.87MB in 8.5s (VMAF overall 94.6, measured against original)
+    - Aveeone AV1 (based on MT): 13.93MB 109.4s (VMAF overall 92.39, measured against original)
+    - Aveeone AV1 (based on raw input): 16.65MB in 83s (VMAF overall 95.94, measured against original)
 - Next steps:
-  - Need VMAF to measure perceptual quality tradeoffs with filesize reduction;
-    could probably raise CRF a lot for an even trade on quality.
+  - Now that we have VMAF scores, measure perceptual quality tradeoffs with
+    filesize reduction; could probably raise CRF a lot for an even trade on quality.
   - Current prototype design using Media Transformations for editing is useful,
     but may need to propose a `quality` lever to get a better output to use in
-    transcode to AV1 --- otherwise we risk "copy of a copy" degradation.
+    transcode to AV1 --- otherwise we risk "copy of a copy" degradation. However
+    current VMAF score shows this is within tolerance.
 
 **v0.3.0:** Route requests via Cloudflare Media Transformations first.
 
