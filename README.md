@@ -14,13 +14,13 @@ https://<host>/<OPTIONS>/<SOURCE_URL>
 ```
 
 - `<OPTIONS>` is the first path segment. It's always used **verbatim, as-is**
-  (no normalization) as part of the R2 cache key — a different string always
+  (no normalization) as part of the cache key — a different string always
   forces a fresh transcode:
   - If it contains an **`=`** (e.g. `width=640,height=360`), it's treated as
     real [Media Transformations](https://developers.cloudflare.com/stream/transform-videos/)
     options string: the *entire* `<OPTIONS>` string is forwarded, unmodified, to
-    this Worker's own `/cdn-cgi/media/<OPTIONS>/<SOURCE_URL>` endpoint first, and
-    the **edited variant** that comes back — not the original source — is what
+    this Worker's own `/cdn-cgi/media/<OPTIONS>/<SOURCE_URL>` endpoint first.
+    The **edited variant** that comes back — not the original source — is what
     gets fed into the AV1 transcoder.
   - If it _does not_ contain `=`, it's just an opaque cache buster.
 - `<SOURCE_URL>` is the full `http(s)` URL of the source MP4. If omitted, a
@@ -80,31 +80,18 @@ client ──▶ Worker (src/index.ts)
            then serves the first client from R2 (full Range support).
 ```
 
-- **Outputs are cached in R2.** The Worker keys each result by
+- **Outputs are "cached" in R2.** The Worker keys each result by
   `sha256(options + sourceUrl)` under a hardcoded namespace, so the
-  `<OPTIONS>` segment is included in the cache key. Thus: repeat requests
-  (including browser **Range**/seek requests) are served straight from R2 with
-  `Content-Length`, `Accept-Ranges`, and `206 Partial Content` — no re-encode.
-- **Media Transformations edits happen before the AV1 encode.** If `<OPTIONS>`
-  contains an `=`, the Worker first requests
-  `https://<host>/cdn-cgi/media/<OPTIONS>/<SOURCE_URL>` — a path Cloudflare
-  intercepts at the edge — and hands the *edited* result to the container as
-  its encode input, instead of `<SOURCE_URL>` directly. Unlike the original
-  source URL, the container DOES need to know this happened (via an
-  `x-media-transform` header the Worker sets) so it can pick the right audio
-  strategy — see below. The job-descriptor pattern still holds otherwise: the
-  container just fetches whichever URL it's given. If `<OPTIONS>` has no `=`,
-  the Media Transformations step is skipped entirely and the container
-  encodes `<SOURCE_URL>` directly.
+  `<OPTIONS>` segment is included in the cache key. Cached outputs can be
+  accessed via `Range` requests --- commonly implemented in browsers and required
+  on iOS.
+- **Media Transformations edits, if requested, happen before the AV1 encode.**
+  If `<OPTIONS>` is likely a transformations string, the Container requests
+  `https://<host>/cdn-cgi/media/<OPTIONS>/<SOURCE_URL>` and transcodes the
+  *edited* result, instead of `<SOURCE_URL>` directly.
 - **Audio is copied, not re-encoded, after a Media Transformations edit.**
   Cloudflare's own MP4 transform already re-encodes audio to AAC at a fixed
-  `64k` (see `../otfe`'s `handlers/thumbnail/service.go`). Re-encoding that a
-  second time would be a wasted lossy generation for no benefit, so the
-  container uses `-c:a copy` for Media Transformations inputs. For a raw
-  source, the container does its own fresh AAC encode, pinned explicitly at
-  `-b:a 96k` — left unpinned, ffmpeg's native `aac` encoder defaults well
-  above what Media Transformations spends, which can quietly cancel out
-  AV1's video-track savings at small resolutions.
+  bitrate. Otherwise, it is re-encoded `aac` at 96k.
 - **Video is forced to 10-bit internal encoding** (`-pix_fmt yuv420p10le`),
   even for 8-bit sources. This is a well-known SVT-AV1/AV1 trick: the extra
   internal precision reduces quantization error and commonly yields smaller
@@ -113,8 +100,8 @@ client ──▶ Worker (src/index.ts)
   consistent output regardless of what the input uses.
 - **Media Transformations preflight is a real `GET`, not a `HEAD`.**
   `/cdn-cgi/media/...` doesn't support `HEAD` or `Range` — Cloudflare treats it
-  as an edge transform, not a static file. Since Media Transformations already
-  validates the source and edit parameters itself, the Worker trusts a
+  as an edge transformation, not a static file. Since Media Transformations
+  already validates the source and edit parameters itself, the Worker trusts a
   `video/*` response as success (without reading the body — the container
   fetches its own copy) and passes through any non-2xx status or non-video
   response as the preflight error, verbatim.
@@ -145,7 +132,7 @@ client ──▶ Worker (src/index.ts)
 | ------------------------- | ----------------------------------------------------- |
 | `src/index.ts`            | Worker: R2 cache + Range serving + `Transcoder` class |
 | `container_src/server.mjs`| HTTP server inside the container that drives ffmpeg   |
-| `Dockerfile`              | `node:22-alpine` + static `ffmpeg` (`libsvtav1`)        |
+| `Dockerfile`              | `node:22-alpine` + static `ffmpeg` (`libsvtav1`)      |
 | `wrangler.jsonc`          | Worker / container / DO / R2 config                   |
 
 ## Develop & deploy
@@ -206,13 +193,12 @@ ffprobe out.mp4
 curl -s -D - -r 0-99999 -o /dev/null "https://aveeone.tsmith.net/x/https://example.com/video.mp4"
 ```
 
-Responses carry an `x-cache: hit|miss` header so you can tell whether the
-object came from R2 or was freshly encoded.
+Responses carry an `x-cache: hit|miss` header indicating if the response came
+from the R2 storage bucket.
 
 ## Failure behaviour
 
-Per spec, **any failure returns HTTP 500 with a JSON body** containing as much
-context as possible, e.g.:
+Any failure returns HTTP 500 with a JSON body with as much context as possible, e.g.:
 
 ```json
 {
@@ -231,13 +217,10 @@ Stages you may see: `request-validation`, `validate-source-url`,
 `post-encode-stat`, `container-unhandled` (container side). The `preflight`
 stage covers unreachable sources and the >1 GiB size cap.
 
-All failures are also logged, and Workers **observability is enabled with 100%
-sampling for both logs and traces** (`wrangler.jsonc`).
+All failures are also logged, and Workers observability is enabled with 100%
+sampling for both logs and traces (`wrangler.jsonc`).
 
 ## Known trade-offs & limitations
-
-These were deliberate choices for a first version — worth understanding before
-relying on it:
 
 1. **First request is synchronous + slow.** `libsvtav1 -preset 6` is much slower
    than realtime, so the first caller for a given source waits for the full
@@ -263,13 +246,10 @@ relying on it:
    We don't probe container/codecs first.
 
 6. **`OPTIONS` is not normalized for the cache key.** The Worker hashes the
-   `<OPTIONS>` path segment exactly as received — no key sorting, no
-   canonicalization. Two requests with semantically-identical but
-   differently-formatted options (e.g. `width=640,height=360` vs
-   `height=360,width=640`, or extra whitespace/casing differences) hash to
+   `<OPTIONS>` path segment exactly as received. Two requests with
+   semantically-identical but differently-formatted/ordered hash to
    different R2 keys and each trigger their own Media Transformations request
-   + AV1 encode, even though they'd produce the same edited video. Callers
-   should format `<OPTIONS>` consistently to get cache reuse.
+   + AV1 encode, even for the same result.
 
 7. **A finished encode is not durable against a broken connection.** Cloudflare
    places no hard duration limit on an HTTP-triggered Worker (CPU-time limits
@@ -292,37 +272,44 @@ relying on it:
 
 ## Version History and Observations:
 
-**v0.3.1:** Audio + pixel format tuning, in response to the v0.3.0 filesize findings
+**v0.3.1:** Minor levers to reduce filesize and normalize consistently
 
-- Motivation: v0.3.0's findings showed AV1 output at parity with, or larger
-  than, Media Transformations' own H.264 in most cases — well short of AV1's
-  usual efficiency advantage. Comparing ffmpeg invocations against `../otfe`
-  (which powers Media Transformations) turned up two concrete gaps before any
-  VMAF-driven CRF/preset work:
-  - Media Transformations' MP4 transform (`otfe`'s
-    `handlers/thumbnail/service.go`) runs plain `libx264` with no explicit
-    `-crf`/`-preset` (so x264's own defaults, CRF 23 / preset medium, apply),
-    and pins audio at `-b:a 64k`.
-  - Aveeone's container had no `-b:a` at all, leaving audio to ffmpeg's native
-    `aac` encoder default — well above 64k, and enough on its own to erase
-    most or all of the video-track AV1 savings at small resolutions.
-- Container changes (`container_src/server.mjs`):
-  - `-c:a copy` when the input is a Media Transformations edited variant
-    (`x-media-transform: true` from the Worker) — Cloudflare has already
-    AAC-encoded that audio at 64k, so re-encoding it again would just be a
-    wasted second lossy generation.
-  - `-c:a aac -b:a 96k` for a raw source — pinned explicitly instead of
-    inheriting ffmpeg's native default.
+- Goal: Latest test showed AV1 output filesize matched or was larger than Media
+  Transformations' own H.264 for the sample. Compared ffmpeg invocations against
+  Media Transformations codebase:
+  - MT uses `libx264` with no explicit `-crf`/`-preset` --- so x264's own
+    defaults, CRF 23 / preset medium, apply.
+  - MT pins `aac` audio output at `-b:a 64k`.
+- Container changes:
+  - `-c:a copy` when the input is a Media Transformations edited variant —
+    Cloudflare has already AAC-encoded that audio at 64k.
+  - Otherwise, pin audio at 96k for a raw source, lower than default.
   - `-pix_fmt yuv420p10le` added unconditionally: forces 10-bit internal
-    SVT-AV1 encoding even from 8-bit sources (a well-established AV1
+    SVT-AV1 encoding even from 8-bit sources --- a well-established\* AV1
     compression trick — more internal precision, less quantization error, at
-    equal-or-better perceptual quality) and pins the pixel format explicitly
-    for consistent output regardless of the source.
-  - CRF (still 30) and preset (still 6) intentionally left alone here; those
-    are the next lever, pending the planned VMAF-based sweep.
-- Worker changes (`src/index.ts`): `generateAndStore()`'s container dispatch
-  now sends `x-media-transform` alongside the existing headers, so the
-  container can select the audio strategy above.
+    equal-or-better perceptual quality.
+    - _\* Citation needed; this was an unexpected Claude suggestion._
+  - CRF (still 30) and preset (still 6) left alone here; need VMAF for comparison.
+- Worker changes:
+  - New header passed to container to indicate if source is Media Transformations.
+    - _@TODO: That should be evident from the URL sent to the container..._
+- Findings:
+  - Fetching sample resized (`width=640`):
+    - Media Transformations H.264: 2.47MB in 2.4s
+    - Aveeone AV1: 2.27MB in 23.2s
+  - Sample at `height=720`:
+    - Media Transformations H.264: 7.16MB in 7.7s
+    - Aveeone AV1: 7.28MB in 56.2s
+  - Sample at `height=1080` (original height):
+    - Media Transformations H.264: 13.87MB in 8.5s
+    - Aveeone AV1 (based on MT): 13.93MB 109.4s
+    - Aveeone AV1 (based on raw input): 16.65MB in 83s
+- Next steps:
+  - Need VMAF to measure perceptual quality tradeoffs with filesize reduction;
+    could probably raise CRF a lot for an even trade on quality.
+  - Current prototype design using Media Transformations for editing is useful,
+    but may need to propose a `quality` lever to get a better output to use in
+    transcode to AV1 --- otherwise we risk "copy of a copy" degradation.
 
 **v0.3.0:** Route requests via Cloudflare Media Transformations first.
 
@@ -347,33 +334,6 @@ relying on it:
     - Media Transformations H.264: 13.8MB in 1.09s
     - Aveeone AV1 based on MT result: 14.19MB in 88.9s
     - Aveeone AV1 based on original: 16.88MB in 109.6s
-
-**v0.2.2:** Request duration / disconnect durability investigation (no code
-changes — documentation only)
-
-- Question: given preset/CRF changes have pushed encode times well past a
-  minute, at what point does the first (blocking) request risk timing out?
-- Findings (see `AGENTS.md` for full detail and sources):
-  - Cloudflare imposes no hard wall-clock duration limit on an HTTP-triggered
-    Worker, and none on a container/DO call while it's in flight, as long as
-    the requesting connection stays open. CPU-time limits (30s default / 300s
-    max) don't apply either, since `fetch()` await time isn't CPU time.
-  - The real ceiling is `ctx.waitUntil()`'s documented 30-second grace period
-    after a disconnect is detected — already relied on in `src/index.ts` as an
-    insurance policy, but only covers ~30s of remaining work, not a full
-    long-running encode if the client leaves early.
-  - `enable_request_signal` is not set, so disconnect-driven cancellation of
-    our own outbound `fetch()` calls is likely not happening automatically
-    today — this is undocumented default behavior, not a guarantee.
-  - Checked the container code directly: nothing listens for a dropped
-    connection during download/encode, so ffmpeg runs to completion regardless
-    (matches intuition) — but the finished file can only be delivered back over
-    the same connection that requested it, so a broken connection after a
-    successful encode currently **wastes** the work rather than salvaging it
-    into the cache.
-- Practical takeaway: no Cloudflare-imposed number to worry about, but
-  intermediary/client idle timeouts (unrelated to Cloudflare) are a real risk
-  now that cold-cache requests can run into the 100-300s+ range.
 
 **v0.2.1:** Performance investigation
 
