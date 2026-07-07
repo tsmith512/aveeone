@@ -137,8 +137,10 @@ reason about.
 ### ffmpeg settings (do not change without updating `OUTPUT_PREFIX`)
 
 ```
--c:v libsvtav1 -preset 6 -crf 26 -svtav1-params lp=4
--c:a aac
+-pix_fmt yuv420p10le
+-c:v libsvtav1 -preset 6 -crf 30 -svtav1-params lp=4
+-c:a copy               (Media Transformations input)
+-c:a aac -b:a 96k       (raw source)
 -dn -map_chapters -1
 -movflags +faststart
 -f mp4
@@ -149,6 +151,21 @@ reason about.
   the vCPU quota; without explicit `lp`, SVT-AV1 spawns too many threads and
   encodes ~4× slower. If `instance_type` changes, update `lp` in
   `buildFfmpegArgs`.
+- `-pix_fmt yuv420p10le` forces 10-bit internal encoding even for 8-bit
+  sources — a well-established SVT-AV1/AV1 trick that commonly shrinks output
+  at equal-or-better perceptual quality, independent of the source's own bit
+  depth. Also pins the pixel format explicitly rather than inheriting
+  whatever the input happens to use.
+- **Audio strategy depends on `isMediaTransform`** (passed to
+  `buildFfmpegArgs` from the `x-media-transform` header the Worker sets):
+  - Media Transformations input: `-c:a copy`. Cloudflare's own MP4 transform
+    already re-encodes audio to AAC at a fixed `64k` (see `../otfe`'s
+    `handlers/thumbnail/service.go`); re-encoding it again would just be a
+    wasted second lossy generation for no benefit.
+  - Raw source: `-c:a aac -b:a 96k`, i.e. `RAW_AUDIO_BITRATE`. Pinned
+    explicitly — left unset, ffmpeg's native `aac` encoder default lands well
+    above what Media Transformations spends on audio, which can quietly
+    cancel out AV1's video-track savings at small resolutions.
 - `+faststart` (moov at the front) requires a seekable output file — hence the
   temp file rather than a pipe. This gives browsers proper seeking from R2.
 - `-dn -map_chapters -1` — source chapter markers are otherwise muxed into the

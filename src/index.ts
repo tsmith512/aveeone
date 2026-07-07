@@ -377,8 +377,13 @@ async function generateAndStore(
   // a transcoding service (URL in, encoded file out). ffmpeg's native HTTP
   // client handles reconnects and HTTP-level seeking (e.g. moov-at-end
   // recovery). For a Media Transformations request, `encodeUrl` points at the
-  // `/cdn-cgi/media/...` edited variant, so the container never sees (or
-  // needs to know about) the original source URL.
+  // `/cdn-cgi/media/...` edited variant. The container never sees the
+  // original source URL, but it DOES need `isMediaTransform`: a Media
+  // Transformations derivative already has its audio re-encoded to AAC by
+  // Cloudflare (see `otfe`'s `-b:a 64k`), so the container copies that track
+  // instead of paying for a second lossy re-encode; a raw source gets a
+  // fresh AAC encode at a pinned bitrate. See `buildFfmpegArgs()` in
+  // container_src/server.mjs.
   const dispatchedAt = Date.now();
   const container = await getRandom(env.TRANSCODER, POOL_SIZE);
   const containerRequest = new Request("http://container/transcode", {
@@ -386,6 +391,7 @@ async function generateAndStore(
     headers: {
       "x-source-url": encodeUrl,
       "x-request-id": requestId,
+      "x-media-transform": String(isMediaTransform),
       // Used by the container to measure cold-start + routing latency.
       "x-dispatched-at": String(dispatchedAt),
     },

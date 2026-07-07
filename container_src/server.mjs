@@ -39,10 +39,28 @@ const NPROC = (() => {
 })();
 console.log("aveeone.container.startup", JSON.stringify({ nproc: NPROC }));
 
+// Audio bitrate for a raw (non-Media-Transformations) source. Cloudflare's own
+// Media Transformations MP4 output already re-encodes audio to AAC at 64k (see
+// otfe's handlers/thumbnail/service.go); a raw source gets its own fresh AAC
+// encode, pinned explicitly rather than left to ffmpeg's native `aac` encoder
+// default (which, unpinned, lands well above what Media Transformations
+// spends and can quietly erase AV1's video-track savings at small resolutions).
+const RAW_AUDIO_BITRATE = "96k";
+
 // Build the ffmpeg argument list. Both input and output are local temp files:
 // downloading separately gives us a clean download-vs-encode time split, and
 // a local input lets ffmpeg seek freely (required for some source formats).
-function buildFfmpegArgs(inPath, outPath) {
+//
+// `isMediaTransform` selects the audio strategy:
+// - true:  the input is a Media Transformations edited variant, whose audio
+//          Cloudflare has already re-encoded to AAC. Copy that track as-is
+//          (`-c:a copy`) instead of paying for a second lossy re-encode.
+// - false: the input is a raw source; encode audio fresh at RAW_AUDIO_BITRATE.
+function buildFfmpegArgs(inPath, outPath, isMediaTransform) {
+  const audioArgs = isMediaTransform
+    ? ["-c:a", "copy"]
+    : ["-c:a", "aac", "-b:a", RAW_AUDIO_BITRATE];
+
   return [
     "-hide_banner",
     "-loglevel",
@@ -50,6 +68,15 @@ function buildFfmpegArgs(inPath, outPath) {
     "-y",
     "-i",
     inPath,
+    // Force 10-bit internal encoding even for 8-bit sources. This is a
+    // well-known SVT-AV1/AV1 trick: the extra internal precision reduces
+    // quantization error and commonly yields smaller files at equal or
+    // better perceptual quality than 8-bit, independent of the source's own
+    // bit depth. It also pins the pixel format explicitly instead of
+    // inheriting whatever the source (or Media Transformations) happens to
+    // use, for consistent output regardless of input.
+    "-pix_fmt",
+    "yuv420p10le",
     // Video: AV1 via SVT-AV1. lp=4 pins the logical-processor count to the
     // standard-4 vCPU allocation (nproc inside CF containers may report the
     // host's physical count, causing over-threading on a 4-vCPU machine).
@@ -61,9 +88,7 @@ function buildFfmpegArgs(inPath, outPath) {
     "30",
     "-svtav1-params",
     "lp=4",
-    // Audio: AAC
-    "-c:a",
-    "aac",
+    ...audioArgs,
     // Drop data streams and chapter markers. Chapters are otherwise muxed into
     // the output as a stray bin_data text track that -dn alone won't remove.
     "-dn",
@@ -137,6 +162,11 @@ async function downloadSource(sourceUrl, requestId) {
 async function handleTranscode(req, res) {
   const sourceUrl = req.headers["x-source-url"];
   const requestId = req.headers["x-request-id"] || "unknown";
+  // x-media-transform is set by the Worker: true when x-source-url points at
+  // a Media Transformations edited variant (already AAC-encoded by
+  // Cloudflare) rather than a raw source. Selects the audio strategy in
+  // buildFfmpegArgs — see the comment there.
+  const isMediaTransform = req.headers["x-media-transform"] === "true";
   // x-dispatched-at is set by the Worker immediately before container.fetch().
   // The delta (Date.now() - dispatchedAt) captures container cold-start time
   // plus internal routing — close to 0 when warm, ~2-3s on a cold start.
@@ -173,9 +203,9 @@ async function handleTranscode(req, res) {
 
   // --- Phase 2: encode to output temp file ---
   const outPath = join(tmpdir(), `aveeone-out-${randomUUID()}.mp4`);
-  const args = buildFfmpegArgs(inPath, outPath);
+  const args = buildFfmpegArgs(inPath, outPath, isMediaTransform);
   const encodeStart = Date.now();
-  console.log("aveeone.container.encode.start", JSON.stringify({ requestId, sourceUrl }));
+  console.log("aveeone.container.encode.start", JSON.stringify({ requestId, sourceUrl, isMediaTransform }));
 
   let ffmpeg;
   try {

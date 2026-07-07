@@ -68,8 +68,9 @@ client ──▶ Worker (src/index.ts)
                 │    Media Transforms.   → GET, video/* response? (trust CF's own checks)
                 ▼
            ffmpeg -i <encodeUrl>
-                   -c:v libsvtav1 -preset 6 -crf 26
-                   -c:a aac
+                   -pix_fmt yuv420p10le
+                   -c:v libsvtav1 -preset 6 -crf 30 -svtav1-params lp=4
+                   -c:a copy (Media Transformations input) | aac -b:a 96k (raw source)
                    -dn -map_chapters -1
                    -movflags +faststart
                    -f mp4 /tmp/<id>.mp4        (encode to disk)
@@ -88,10 +89,28 @@ client ──▶ Worker (src/index.ts)
   contains an `=`, the Worker first requests
   `https://<host>/cdn-cgi/media/<OPTIONS>/<SOURCE_URL>` — a path Cloudflare
   intercepts at the edge — and hands the *edited* result to the container as
-  its encode input, instead of `<SOURCE_URL>` directly. The container is
-  unaware this happened; it just fetches whatever URL it's given (the
-  job-descriptor pattern still holds). If `<OPTIONS>` has no `=`, this step is
-  skipped entirely and the container encodes `<SOURCE_URL>` as before.
+  its encode input, instead of `<SOURCE_URL>` directly. Unlike the original
+  source URL, the container DOES need to know this happened (via an
+  `x-media-transform` header the Worker sets) so it can pick the right audio
+  strategy — see below. The job-descriptor pattern still holds otherwise: the
+  container just fetches whichever URL it's given. If `<OPTIONS>` has no `=`,
+  the Media Transformations step is skipped entirely and the container
+  encodes `<SOURCE_URL>` directly.
+- **Audio is copied, not re-encoded, after a Media Transformations edit.**
+  Cloudflare's own MP4 transform already re-encodes audio to AAC at a fixed
+  `64k` (see `../otfe`'s `handlers/thumbnail/service.go`). Re-encoding that a
+  second time would be a wasted lossy generation for no benefit, so the
+  container uses `-c:a copy` for Media Transformations inputs. For a raw
+  source, the container does its own fresh AAC encode, pinned explicitly at
+  `-b:a 96k` — left unpinned, ffmpeg's native `aac` encoder defaults well
+  above what Media Transformations spends, which can quietly cancel out
+  AV1's video-track savings at small resolutions.
+- **Video is forced to 10-bit internal encoding** (`-pix_fmt yuv420p10le`),
+  even for 8-bit sources. This is a well-known SVT-AV1/AV1 trick: the extra
+  internal precision reduces quantization error and commonly yields smaller
+  files at equal or better perceptual quality than 8-bit, independent of the
+  source's own bit depth. It also pins the pixel format explicitly for
+  consistent output regardless of what the input uses.
 - **Media Transformations preflight is a real `GET`, not a `HEAD`.**
   `/cdn-cgi/media/...` doesn't support `HEAD` or `Range` — Cloudflare treats it
   as an edge transform, not a static file. Since Media Transformations already
@@ -272,6 +291,38 @@ relying on it:
    deferred for this POC. See `AGENTS.md` for the full analysis.
 
 ## Version History and Observations:
+
+**v0.3.1:** Audio + pixel format tuning, in response to the v0.3.0 filesize findings
+
+- Motivation: v0.3.0's findings showed AV1 output at parity with, or larger
+  than, Media Transformations' own H.264 in most cases — well short of AV1's
+  usual efficiency advantage. Comparing ffmpeg invocations against `../otfe`
+  (which powers Media Transformations) turned up two concrete gaps before any
+  VMAF-driven CRF/preset work:
+  - Media Transformations' MP4 transform (`otfe`'s
+    `handlers/thumbnail/service.go`) runs plain `libx264` with no explicit
+    `-crf`/`-preset` (so x264's own defaults, CRF 23 / preset medium, apply),
+    and pins audio at `-b:a 64k`.
+  - Aveeone's container had no `-b:a` at all, leaving audio to ffmpeg's native
+    `aac` encoder default — well above 64k, and enough on its own to erase
+    most or all of the video-track AV1 savings at small resolutions.
+- Container changes (`container_src/server.mjs`):
+  - `-c:a copy` when the input is a Media Transformations edited variant
+    (`x-media-transform: true` from the Worker) — Cloudflare has already
+    AAC-encoded that audio at 64k, so re-encoding it again would just be a
+    wasted second lossy generation.
+  - `-c:a aac -b:a 96k` for a raw source — pinned explicitly instead of
+    inheriting ffmpeg's native default.
+  - `-pix_fmt yuv420p10le` added unconditionally: forces 10-bit internal
+    SVT-AV1 encoding even from 8-bit sources (a well-established AV1
+    compression trick — more internal precision, less quantization error, at
+    equal-or-better perceptual quality) and pins the pixel format explicitly
+    for consistent output regardless of the source.
+  - CRF (still 30) and preset (still 6) intentionally left alone here; those
+    are the next lever, pending the planned VMAF-based sweep.
+- Worker changes (`src/index.ts`): `generateAndStore()`'s container dispatch
+  now sends `x-media-transform` alongside the existing headers, so the
+  container can select the audio strategy above.
 
 **v0.3.0:** Route requests via Cloudflare Media Transformations first.
 
