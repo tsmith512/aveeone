@@ -274,26 +274,16 @@ sampling for both logs and traces (`wrangler.jsonc`).
 
 **v0.3.2:** CRF bump, informed by VMAF
 
-- Goal: v0.3.1's VMAF numbers (measured against original, `height=1080`,
-  no-resize case) showed CRF 30 overshooting quality relative to the
-  practical target: MT's own H.264 baseline scores 94.6, but Aveeone AV1 at
-  CRF 30 scored 95.94 from the raw source (over-target, wasting bits) and
-  92.39 from the MT-derived source (under-target AND no smaller than MT's
-  own output — a strictly worse trade). Common encoding-industry guidance
-  puts the practical "very good, indistinguishable in normal viewing"
-  VMAF band around 90-95, with returns flattening sharply above ~95 — so
-  CRF 30 had real headroom to trade quality for size.
-- Container changes: `-crf` raised from `30` to `36` in `buildFfmpegArgs`
-  (`container_src/server.mjs`), as a first test point in a planned CRF
-  sweep (34/38/42 were also discussed) rather than a fully-tuned final
-  value.
-- Worker changes: `OUTPUT_PREFIX` bumped `gen2` -> `gen3` (per the standing
-  rule: bump whenever encode semantics change), so this change actually
-  produces fresh encodes instead of continuing to serve `gen2`'s CRF-30
-  objects from R2 under the same keys.
-- Next steps: re-measure VMAF/filesize at CRF 36 for both the raw-source and
-  MT-derived paths, especially the MT-derived path where it's not yet clear
-  any CRF beats MT's own H.264 output on both axes at once.
+- Goal: v0.3.1's VMAF numbers showed CRF 30 overshooting quality relative to the
+  practical target. Increase CRF to shoot for a VMAF closer to 90 and record
+  any size or encoding time savings.
+- Container changes: `-crf` raised from `30` to `36`
+- Worker changes: Storage namespace incremented
+- Findings:
+  - Sample at `height=1080` (original height) and CRF 36:
+    - (Previous reference) Media Transformations H.264: 13.87MB in 8.5s (VMAF overall 94.6, measured against original)
+    - Aveeone AV1 (based on MT): 13.93MB in 69s (VMAF overall 91.02, measured against original)
+    - Aveeone AV1 (based on raw input): 10.8MB in 87s (VMAF overall 93.73, measured against original)
 
 **v0.3.1:** Minor levers to reduce filesize and normalize consistently
 
@@ -325,7 +315,7 @@ sampling for both logs and traces (`wrangler.jsonc`).
     - Aveeone AV1: 7.28MB in 56.2s
   - Sample at `height=1080` (original height):
     - Media Transformations H.264: 13.87MB in 8.5s (VMAF overall 94.6, measured against original)
-    - Aveeone AV1 (based on MT): 13.93MB 109.4s (VMAF overall 92.39, measured against original)
+    - Aveeone AV1 (based on MT): 13.93MB in 109.4s (VMAF overall 92.39, measured against original)
     - Aveeone AV1 (based on raw input): 16.65MB in 83s (VMAF overall 95.94, measured against original)
 - Next steps:
   - Now that we have VMAF scores, measure perceptual quality tradeoffs with
