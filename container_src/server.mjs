@@ -85,7 +85,7 @@ function buildFfmpegArgs(inPath, outPath, isMediaTransform) {
     "-preset",
     "6",
     "-crf",
-    "30",
+    "36",
     "-svtav1-params",
     "lp=4",
     ...audioArgs,
