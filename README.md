@@ -133,23 +133,29 @@ npm run deploy
 > Deploying containers requires Docker available locally for the image build,
 > and a Cloudflare account with Containers (beta) enabled.
 
-### Container image cache gotcha
+### Container image builds and pushes
 
-`wrangler deploy` detects whether the container image needs a rebuild by
-hashing the **Dockerfile** — it does not hash the files `COPY`'d into the
-image. This means changes to `container_src/server.mjs` (the only file copied
-in) are **silently ignored** and the old container code keeps running.
+`wrangler deploy` always runs a real `docker build` for any container backed
+by a `dockerfile` (verified by reading `buildContainer`/`buildAndMaybePush` in
+the installed `wrangler` package, not assumed) — there's no Dockerfile-hash
+check that skips building. That build uses Docker's normal layer cache
+(no `--no-cache`), which is content-addressed per instruction, so a plain
+`npm run deploy` after editing `container_src/server.mjs` **does** pick up the
+change on its own; no extra step is required for correctness.
 
-Whenever you change `container_src/server.mjs`, force a fresh image before
-deploying:
+What *does* get skipped is the **push**: after building, wrangler compares the
+freshly-built image's digest to what's already live in the registry and only
+pushes if they differ. `Image already exists remotely, skipping push` is the
+expected, correct message when your change didn't alter the image — not a
+sign something's stuck.
 
-```bash
-docker build --no-cache .   # rebuild without layer cache
-npm run deploy              # push the new image + deploy the Worker
-```
-
-If `wrangler deploy` shows `Image already exists remotely, skipping push` when
-you expected a container change to take effect, this is why.
+If you ever do want to force a completely from-scratch build (e.g. you
+suspect the local Docker cache is stale or corrupted), `docker build --no-cache .`
+before `npm run deploy` works, but treat it as a last resort rather than
+routine practice: it invalidates *every* layer, including ones that didn't
+change — such as the ~400 MB `COPY --from=ffmpeg` layer — which can force a
+large, slow re-push of content that was already sitting in the registry
+unchanged.
 
 ### Try it
 

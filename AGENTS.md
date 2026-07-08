@@ -299,22 +299,47 @@ npm run typecheck          # must pass
 npm run deploy             # wrangler deploy
 ```
 
-### ⚠️ Container image cache gotcha
+### Container image builds and pushes
 
-`wrangler deploy` detects image rebuild need by hashing the **Dockerfile**, not
-the files it `COPY`s. Changes to `container_src/server.mjs` are **silently
-skipped** and the old container code keeps running.
+**Correction (verified against `wrangler` v4.105.0 source,
+`buildContainer`/`buildAndMaybePush` in the installed package's
+`wrangler-dist/cli.js`):** an earlier version of this doc claimed `wrangler
+deploy` decides whether to rebuild by hashing the Dockerfile, and that
+`container_src/server.mjs` changes were silently skipped as a result. That is
+**not** what the code does, and the claim should be treated as incorrect —
+don't repeat it.
 
-When `container_src/server.mjs` changes:
+What actually happens, every `wrangler deploy` with a `dockerfile`-backed
+container:
 
-```bash
-docker build --no-cache .   # force rebuild without layer cache
-npm run deploy
-```
+1. `deployContainers()` unconditionally calls `buildContainer()` — there is no
+   pre-check that skips building based on the Dockerfile's content.
+2. `buildContainer()` → `buildAndMaybePush()` runs a plain
+   `docker build --load -t <tag> ... -f - <context>` — **no `--no-cache`**.
+   This relies on Docker's own normal layer cache, which hashes `COPY`
+   instructions by the actual file content, not the Dockerfile text or
+   mtimes. So a bare `npm run deploy` after editing `container_src/server.mjs`
+   already picks up the change correctly, with no manual build step needed.
+3. *After* the build, wrangler runs `docker image inspect` + `docker manifest
+   inspect` to compare the freshly-built local image's digest against what's
+   already live in the registry, and only pushes if they differ.
 
-Confirm the deploy updated the image: look for the `-` / `+` `image:` hash diff
-in the wrangler output. If it says `Image already exists remotely, skipping
-push`, the old image is still live.
+`Image already exists remotely, skipping push` is that comparison working as
+intended — it means the build genuinely produced the same image as what's
+already deployed, not that your change was ignored. Confirm a real change
+took effect by checking the `-`/`+` `image:` digest diff in the container
+application section of the deploy output.
+
+`docker build --no-cache .` before `npm run deploy` still works, but reach for
+it only if you suspect the local Docker build cache itself is stale or
+corrupted — not as routine practice after every `container_src/server.mjs`
+edit. It invalidates *every* layer, including ones that didn't change (e.g.
+the ~400 MB `COPY --from=ffmpeg` layer), which can force a large, slow
+re-push of content that was already sitting in the registry unchanged. This
+bit us in practice: a `--no-cache` build once produced a non-reproduced
+digest for that untouched layer, requiring a full ~400 MB re-upload over a
+flaky connection, when a plain `docker build .` (or no manual build at all)
+would have reused the already-pushed layer.
 
 ### Local dev
 
