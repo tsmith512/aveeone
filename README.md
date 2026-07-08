@@ -136,26 +136,13 @@ npm run deploy
 ### Container image builds and pushes
 
 `wrangler deploy` always runs a real `docker build` for any container backed
-by a `dockerfile` (verified by reading `buildContainer`/`buildAndMaybePush` in
-the installed `wrangler` package, not assumed) — there's no Dockerfile-hash
-check that skips building. That build uses Docker's normal layer cache
-(no `--no-cache`), which is content-addressed per instruction, so a plain
-`npm run deploy` after editing `container_src/server.mjs` **does** pick up the
-change on its own; no extra step is required for correctness.
+by a `dockerfile`, so a plain `npm run deploy` after editing
+`container_src/server.mjs` **does** pick up the change on its own. If the
+rebuilt image matches what's already live in the registry, the push is skipped.
 
-What *does* get skipped is the **push**: after building, wrangler compares the
-freshly-built image's digest to what's already live in the registry and only
-pushes if they differ. `Image already exists remotely, skipping push` is the
-expected, correct message when your change didn't alter the image — not a
-sign something's stuck.
-
-If you ever do want to force a completely from-scratch build (e.g. you
-suspect the local Docker cache is stale or corrupted), `docker build --no-cache .`
-before `npm run deploy` works, but treat it as a last resort rather than
-routine practice: it invalidates *every* layer, including ones that didn't
-change — such as the ~400 MB `COPY --from=ffmpeg` layer — which can force a
-large, slow re-push of content that was already sitting in the registry
-unchanged.
+To force a completely from-scratch build (e.g. you suspect the local Docker
+cache is stale or corrupted), use `docker build --no-cache .`
+before `npm run deploy`.
 
 ### Try it
 
