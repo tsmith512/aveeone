@@ -79,7 +79,7 @@ Transcoder Container (container_src/server.mjs)
                      x-encode-elapsed-ms, x-input-size, x-nproc
 
 R2 (aveeone-prod)
-  └─ key: gen4/av1/<sha256>
+  └─ key: gen3/av1/<sha256>
 ```
 
 ### Job-descriptor pattern
@@ -184,7 +184,7 @@ reason about.
 
 where `sha256hex = sha256(options + "\n" + sourceUrl)`.
 
-- **`OUTPUT_PREFIX`** is currently `"gen4"`. Bump it whenever the output
+- **`OUTPUT_PREFIX`** is currently `"gen3"`. Bump it whenever the output
   semantics change (different encode settings, different output format, etc.).
   Objects under the old prefix are not cleaned up automatically.
 - The `\n` separator between options and sourceUrl is unambiguous because a

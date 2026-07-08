@@ -272,24 +272,21 @@ sampling for both logs and traces (`wrangler.jsonc`).
 
 ## Version History and Observations:
 
-**v0.3.3:** Continuing the CRF sweep: 36 -> 40
-
-- `-crf` raised again, `container_src/server.mjs`, no other changes.
-- `OUTPUT_PREFIX` bumped `gen3` -> `gen4` so this produces fresh encodes.
-- Pending: VMAF/filesize re-measurement at CRF 40 for both paths.
-
 **v0.3.2:** CRF bump, informed by VMAF
 
-- Goal: v0.3.1's VMAF numbers showed CRF 30 overshooting quality relative to the
-  practical target. Increase CRF to shoot for a VMAF closer to 90 and record
-  any size or encoding time savings.
-- Container changes: `-crf` raised from `30` to `36`
+- Goal: Increase CRF to shoot for a VMAF closer to 90 and record any size or
+  encoding time savings.
+- Container changes: `-crf` raised from `30` to `36` then `40`
 - Worker changes: Storage namespace incremented
 - Findings:
   - Sample at `height=1080` (original height) and CRF 36:
     - (Previous reference) Media Transformations H.264: 13.87MB in 8.5s (VMAF overall 94.6, measured against original)
     - Aveeone AV1 (based on MT): 13.93MB in 69s (VMAF overall 91.02, measured against original)
     - Aveeone AV1 (based on raw input): 10.8MB in 87s (VMAF overall 93.73, measured against original)
+  - Sample at `height=1080` and CRF 40:
+    - (Previous reference) MT H.264: 13.87MB in 8.5s (VMAF overall 94.6)
+    - Aveeone AV1 (based on MT): 7.2MB in 54s (VMAF overall 89.9)
+    - Aveeone AV1 (based on raw input): 8.5MB in 66s (VMAF overall 92.2)
 
 **v0.3.1:** Minor levers to reduce filesize and normalize consistently
 

@@ -39,10 +39,9 @@ const POOL_SIZE = 2;
  *
  * gen1 - produces UNEDITED assets only, only in AV1/AAC
  * gen2 - transcodes CF Media Transformations results to AV1/AAC
- * gen3 - CRF bumped 30 -> 36 (VMAF-informed; see README v0.3.1 findings)
- * gen4 - CRF bumped 36 -> 40 (continuing the CRF sweep)
+ * gen3 - CRF bumped 30 -> 40 (VMAF-informed; see README v0.3.1 findings)
  */
-const OUTPUT_PREFIX = "gen4";
+const OUTPUT_PREFIX = "gen3";
 
 /** Multipart part size while streaming the encode into R2 (>= 5 MiB required). */
 const R2_PART_SIZE = 8 * 1024 * 1024;
