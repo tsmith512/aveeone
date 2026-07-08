@@ -87,12 +87,12 @@ client ──▶ Worker (src/index.ts)
 - **Audio is copied, not re-encoded, after a Media Transformations edit.**
   Cloudflare's own MP4 transform already re-encodes audio to AAC at a fixed
   bitrate. Otherwise, it is re-encoded `aac` at 96k.
-- **Video is forced to 10-bit internal encoding** (`-pix_fmt yuv420p10le`),
-  even for 8-bit sources. This is a well-known SVT-AV1/AV1 trick: the extra
-  internal precision reduces quantization error and commonly yields smaller
-  files at equal or better perceptual quality than 8-bit, independent of the
-  source's own bit depth. It also pins the pixel format explicitly for
-  consistent output regardless of what the input uses.
+- **Video is encoded to 10-bit** (`-pix_fmt yuv420p10le`), even for
+  8-bit sources. This is a common practice that _can_ reduce rounding/quantization
+  error in the encode/reconstruction loop which may improve perceptual quality
+  or compression efficiency. In tests, the gain was models. But it also pins the
+  pixel format explicitly for normalized output.
+  - Ref ["Why does 10-bit save bandwidth?" (Ateme)](https://web.archive.org/web/20111027042832id_/http://x264.nl:80/x264/10bit_02-ateme-why_does_10bit_save_bandwidth.pdf)
 - **Media Transformations preflight is a real `GET`, not a `HEAD`** because it
   is an edge transformation, not a static file. If Media Transformations returns
   a video, it is assumed acceptable. If it returns an error, it is surfaced in
@@ -227,23 +227,14 @@ sampling for both logs and traces (`wrangler.jsonc`).
    their own Media Transformations request and AV1 encode.
 
 7. **A finished encode is not durable against a broken connection.** Cloudflare
-   places no hard duration limit on an HTTP-triggered Worker (CPU-time limits
-   don't count time spent awaiting `fetch()`, and container/DO calls have
-   unlimited wall time while the call is in flight), so long encodes are not a
-   Cloudflare *platform* timeout risk. The real risks are (a) intermediary/
-   client idle-response timeouts unrelated to Cloudflare — our response sends
-   zero bytes until the entire pipeline finishes, which is the worst case for
-   surviving a proxy or browser idle timeout — and (b) `ctx.waitUntil()`'s
-   documented **30-second** grace period, which only starts counting once a
-   disconnect is detected and would not be enough to finish a long in-progress
-   encode if triggered partway through. Separately, if the connection between
-   Worker and container (or the Worker's R2 upload) drops for any reason after
-   ffmpeg has already produced a file, that finished output is currently
-   **discarded, not salvaged** — the container has no way to persist a result
-   except by streaming it back over the same connection that requested it.
-   Closing this gap would mean having the container upload directly to R2
-   (independent of the Worker/client connection), which was considered and
-   deferred for this POC. See `AGENTS.md` for the full analysis.
+   places no hard wall-clock duration limit on an HTTP-triggered Worker, so long
+   encodes shouldn't be a Cloudflare _platform_ timeout risk. The real risks are
+   client idle-response timeouts — Aveeone does not send any bytes until the
+   entire pipeline finishes. Also, Aveeone uses `ctx.waitUntil()` which offers a
+   _30-second_ grace period post-disconnect, but that's probably not long
+   enough to finish a long in-progress encode if triggered partway through.
+   Finally, if the connection between Worker and container drops _or_ the
+   Worker's R2 upload hits an error, the finished output is _discarded._
 
 ## Version History and Observations:
 
