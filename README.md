@@ -69,7 +69,7 @@ client ──▶ Worker (src/index.ts)
                 ▼
            ffmpeg -i <encodeUrl>
                    -pix_fmt yuv420p10le
-                   -c:v libsvtav1 -preset 6 -crf 36 -svtav1-params lp=4
+                   -c:v libsvtav1 -preset 6 -crf 40 -svtav1-params lp=4
                    -c:a copy (Media Transformations input) | aac -b:a 96k (raw source)
                    -dn -map_chapters -1
                    -movflags +faststart
@@ -271,6 +271,12 @@ sampling for both logs and traces (`wrangler.jsonc`).
    deferred for this POC. See `AGENTS.md` for the full analysis.
 
 ## Version History and Observations:
+
+**v0.3.3:** Continuing the CRF sweep: 36 -> 40
+
+- `-crf` raised again, `container_src/server.mjs`, no other changes.
+- `OUTPUT_PREFIX` bumped `gen3` -> `gen4` so this produces fresh encodes.
+- Pending: VMAF/filesize re-measurement at CRF 40 for both paths.
 
 **v0.3.2:** CRF bump, informed by VMAF
 
