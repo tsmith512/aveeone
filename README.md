@@ -287,6 +287,9 @@ sampling for both logs and traces (`wrangler.jsonc`).
     - (Previous reference) MT H.264: 13.87MB in 8.5s (VMAF overall 94.6)
     - Aveeone AV1 (based on MT): 7.2MB in 54s (VMAF overall 89.9)
     - Aveeone AV1 (based on raw input): 8.5MB in 66s (VMAF overall 92.2)
+  - Sample at `width=640` and CRF 40:
+    - MT H.264: 2.5MB in 1s
+    - Aveeone AV1 (based on MT): 1.3MB in 15s (VMAF _against MT 640_ 90.9)
 
 **v0.3.1:** Minor levers to reduce filesize and normalize consistently
 
