@@ -16,29 +16,27 @@ https://<host>/<OPTIONS>/<SOURCE_URL>
 - `<OPTIONS>` is the first path segment. It's always used **verbatim, as-is**
   (no normalization) as part of the cache key — a different string always
   forces a fresh transcode:
-  - If it contains an **`=`** (e.g. `width=640,height=360`), it's treated as
+  - If it contains an `=` (e.g. `width=640,height=360`), it's treated as
     real [Media Transformations](https://developers.cloudflare.com/stream/transform-videos/)
-    options string: the *entire* `<OPTIONS>` string is forwarded, unmodified, to
-    this Worker's own `/cdn-cgi/media/<OPTIONS>/<SOURCE_URL>` endpoint first.
-    The **edited variant** that comes back — not the original source — is what
-    gets fed into the AV1 transcoder.
+    options string: the *entire* `<OPTIONS>` string is used, unmodified, on
+    this Worker's own `/cdn-cgi/media/<OPTIONS>/<SOURCE_URL>` endpoint as the
+    source. The **edited variant** that comes back — not the original — is what
+    gets transcoded. This propagates transformations-based edits.
   - If it _does not_ contain `=`, it's just an opaque cache buster.
 - `<SOURCE_URL>` is the full `http(s)` URL of the source MP4. If omitted, a
   default test clip (`https://assets.tsmith.net/aus-mobile.mp4`) is used.
-
-Deployed at **https://aveeone.tsmith.net** (custom domain).
 
 ### Example
 
 ```
 # Plain cache buster, no Media Transformations edit:
-https://aveeone.tsmith.net/x/https://example.com/video.mp4
+https://example.com/x/https://example.com/video.mp4
 
 # Media Transformations edit (resized + trimmed) applied before AV1 encode:
-https://aveeone.tsmith.net/width=640,height=360/https://example.com/video.mp4
+https://example.com/width=640,height=360/https://example.com/video.mp4
 
 # No source URL -> transcodes the default test footage:
-https://aveeone.tsmith.net/
+https://example.com/
 ```
 
 ## How it works
@@ -81,14 +79,11 @@ client ──▶ Worker (src/index.ts)
 ```
 
 - **Outputs are "cached" in R2.** The Worker keys each result by
-  `sha256(options + sourceUrl)` under a hardcoded namespace, so the
-  `<OPTIONS>` segment is included in the cache key. Cached outputs can be
-  accessed via `Range` requests --- commonly implemented in browsers and required
-  on iOS.
+  `sha256(options + sourceUrl)` under a hardcoded namespace. Cached outputs can
+  be accessed via `Range` requests --- commonly used in browsers video elements.
 - **Media Transformations edits, if requested, happen before the AV1 encode.**
-  If `<OPTIONS>` is likely a transformations string, the Container requests
-  `https://<host>/cdn-cgi/media/<OPTIONS>/<SOURCE_URL>` and transcodes the
-  *edited* result, instead of `<SOURCE_URL>` directly.
+  If `<OPTIONS>` is likely a transformations string, the Container uses
+  `https://<host>/cdn-cgi/media/<OPTIONS>/<SOURCE_URL>` as the transcode source.
 - **Audio is copied, not re-encoded, after a Media Transformations edit.**
   Cloudflare's own MP4 transform already re-encodes audio to AAC at a fixed
   bitrate. Otherwise, it is re-encoded `aac` at 96k.
@@ -98,33 +93,20 @@ client ──▶ Worker (src/index.ts)
   files at equal or better perceptual quality than 8-bit, independent of the
   source's own bit depth. It also pins the pixel format explicitly for
   consistent output regardless of what the input uses.
-- **Media Transformations preflight is a real `GET`, not a `HEAD`.**
-  `/cdn-cgi/media/...` doesn't support `HEAD` or `Range` — Cloudflare treats it
-  as an edge transformation, not a static file. Since Media Transformations
-  already validates the source and edit parameters itself, the Worker trusts a
-  `video/*` response as success (without reading the body — the container
-  fetches its own copy) and passes through any non-2xx status or non-video
-  response as the preflight error, verbatim.
+- **Media Transformations preflight is a real `GET`, not a `HEAD`** because it
+  is an edge transformation, not a static file. If Media Transformations returns
+  a video, it is assumed acceptable. If it returns an error, it is surfaced in
+  an error payload by Aveeone.
 - **First request blocks.** On a miss the first caller waits for the full
-  encode, then is served from R2, so even the first response is seekable. The
-  R2 upload runs under `ctx.waitUntil`, so the object still lands even if that
-  caller disconnects mid-encode.
+  encode and upload to R2. Prefetching alleviates this.
 - **No truncated caches.** The container encodes to a temp file and only
   responds `200` (with `Content-Length`) on `ffmpeg` exit `0`; any failure is a
-  non-200, so a partial object is never stored. The Worker `abort()`s the
-  multipart upload on any stream error.
-- Before dispatching to the container, the Worker preflights `encodeUrl`. For a
-  plain source this is a `HEAD` request that rejects inputs whose
-  `Content-Length` exceeds **1 GiB**. For a Media Transformations request
-  (`encodeUrl` is `/cdn-cgi/media/...`), `HEAD`/`Range` aren't supported there,
-  so the Worker does a real `GET` instead and trusts Media Transformations'
-  own validation: a `video/*` response means the edit succeeded; anything else
-  — including its own size/reachability errors — is surfaced directly as a
-  `500` JSON `preflight` failure. Either way, a failed preflight returns `500`
-  JSON with context before any container is spun up.
-- Output is a standard **faststart MP4** (`moov` atom at the front) for clean
-  in-browser seeking — possible because the container writes to a seekable file
-  rather than a pipe.
+  non-200, so a partial object is never stored. The Worker will `abort() the
+  upload.
+- Before dispatching to the container, the Worker preflights `encodeUrl` to check
+  the 1GB filesize cap or for a Media Transformations success. Either way, a
+  failed preflight returns `500` JSON with context _before_ any container starts.
+- Output is a standard **faststart MP4** for clean in-browser seeking.
 
 ## Project layout
 
@@ -174,23 +156,23 @@ you expected a container change to take effect, this is why.
 ```bash
 # Transcode a specific source (options has no "=", so it's just a cache buster):
 curl -L \
-  "https://aveeone.tsmith.net/x/https://example.com/video.mp4" \
+  "https://example.com/x/https://example.com/video.mp4" \
   -o out.mp4
 
 # Apply a Media Transformations edit (resize) before the AV1 encode:
 curl -L \
-  "https://aveeone.tsmith.net/width=640,height=360/https://example.com/video.mp4" \
+  "https://example.com/width=640,height=360/https://example.com/video.mp4" \
   -o out-640x360.mp4
 
 # Or just hit the root to transcode the default test footage:
-curl -L "https://aveeone.tsmith.net/" -o out.mp4
+curl -L "https://example.com/" -o out.mp4
 
 # Inspect the result (should report av1 video + aac audio, no data track):
 ffprobe out.mp4
 
 # Second request for the same source is served from R2 (x-cache: hit).
 # Range requests are satisfied from R2 with 206 Partial Content:
-curl -s -D - -r 0-99999 -o /dev/null "https://aveeone.tsmith.net/x/https://example.com/video.mp4"
+curl -s -D - -r 0-99999 -o /dev/null "https://example.com/x/https://example.com/video.mp4"
 ```
 
 Responses carry an `x-cache: hit|miss` header indicating if the response came
@@ -220,36 +202,29 @@ stage covers unreachable sources and the >1 GiB size cap.
 All failures are also logged, and Workers observability is enabled with 100%
 sampling for both logs and traces (`wrangler.jsonc`).
 
-## Known trade-offs & limitations
+## Known trade-offs & current PoC limitations
 
 1. **First request is synchronous + slow.** `libsvtav1 -preset 6` is much slower
-   than realtime, so the first caller for a given source waits for the full
-   encode before any bytes arrive. Subsequent requests are served instantly from
-   R2. There's no queue/async job model — the first request blocks.
+   than realtime, so the _first_ caller for a given source waits for the full
+   encode before any bytes arrive.
 
 2. **No request coalescing.** Two simultaneous misses for the same source trigger
-   two encodes (last write into R2 wins). Fine for a single-user POC; a production
-   build would coordinate with a lock (e.g. a Durable Object) so concurrent
-   misses share one encode.
+   two encodes (last write into R2 wins).
 
 3. **Cache is never invalidated.** Objects are immutable per
    `OUTPUT_PREFIX`/`sha256(url)` and served with a 1-year `immutable`
-   `Cache-Control`. Changing encode behavior requires bumping `OUTPUT_PREFIX`;
-   stale objects under old prefixes are not cleaned up automatically.
+   `Cache-Control`. Changing encode behavior requires bumping `OUTPUT_PREFIX`.
 
 4. **No origin restrictions.** The Worker will fetch any `http(s)` URL it's
-   given. There's no allowlist, auth, or rate limiting. Add those before
-   exposing this publicly. (The 1 GiB preflight cap only limits size, not
-   destination.)
+   given. There's no allowlist, auth, or rate limiting.
 
 5. **No input verification.** We assume the source is a video ffmpeg can read.
    We don't probe container/codecs first.
 
-6. **`OPTIONS` is not normalized for the cache key.** The Worker hashes the
-   `<OPTIONS>` path segment exactly as received. Two requests with
-   semantically-identical but differently-formatted/ordered hash to
-   different R2 keys and each trigger their own Media Transformations request
-   + AV1 encode, even for the same result.
+6. **`OPTIONS` is _not_ normalized for the cache key.** The Worker hashes the
+   `<OPTIONS>` path segment exactly as received, so two requests with
+   semantically-identical but differently-formatted flags will each trigger
+   their own Media Transformations request and AV1 encode.
 
 7. **A finished encode is not durable against a broken connection.** Cloudflare
    places no hard duration limit on an HTTP-triggered Worker (CPU-time limits
